@@ -97,8 +97,15 @@ st.sidebar.header("⚙️ 看板控制台")
 days = st.sidebar.slider("时间轴范围 (天)", 100, 1500, 400)
 plot_df = df.tail(days)
 
+# --- 🚀 新增安全检查：防止周末API抽风导致数据为空 ---
+if plot_df.empty:
+    st.warning("⚠️ 暂未获取到最新行情数据。可能是周末雅虎财经 API 维护或云端网络延迟，请稍后再试。")
+    st.stop()  # 停止向下运行，防止页面红屏报错
+
+# 如果数据正常，则安全计算
 val = plot_df['总泡沫指数'].iloc[-1]
-delta = val - plot_df['总泡沫指数'].iloc[-2]
+# 加个双保险，防止数据只有1天导致拿不到昨天(-2)的数据
+delta = val - plot_df['总泡沫指数'].iloc[-2] if len(plot_df) > 1 else 0
 
 col1, col2, col3 = st.columns(3)
 col1.metric("🚨 美投 AI 泡沫指数", f"{val:.1f}", f"{delta:.2f}", delta_color="inverse")
