@@ -93,14 +93,15 @@ def fetch_and_calculate():
 with st.spinner('📡 正在从华尔街同步底层数据并渲染全交互大屏...'):
     df = fetch_and_calculate()
 
+# 🚀 智能排雷：一拿到数据就检查，如果是空的立刻清空缓存，绝不留过夜！
+if df.empty:
+    st.cache_data.clear()  # 核心魔法：自动炸毁坏缓存
+    st.warning("⚠️ 云端网络拥堵或雅虎财经 API 临时限流，未获取到完整数据。缓存已自动清理，请几秒钟后刷新网页重试。")
+    st.stop()
+
 st.sidebar.header("⚙️ 看板控制台")
 days = st.sidebar.slider("时间轴范围 (天)", 100, 1500, 400)
 plot_df = df.tail(days)
-
-# --- 🚀 新增安全检查：防止周末API抽风导致数据为空 ---
-if plot_df.empty:
-    st.warning("⚠️ 暂未获取到最新行情数据。可能是周末雅虎财经 API 维护或云端网络延迟，请稍后再试。")
-    st.stop()  # 停止向下运行，防止页面红屏报错
 
 # 如果数据正常，则安全计算
 val = plot_df['总泡沫指数'].iloc[-1]
