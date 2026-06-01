@@ -268,14 +268,18 @@ def fetch_ols_data():
     try:
         # 1. 抓取美股两大数据
         end_date = pd.Timestamp.today()
-        start_date = end_date - pd.Timedelta(days=60) # 拉长一点以覆盖节假日合并
+        # [修改点1]：将动态的 60 天回溯，改为精准锚定今年的 4 月 29 日
+        current_year = end_date.year
+        start_date = pd.Timestamp(f'{current_year}-04-29')
+        
         us_data = yf.download(['^NDX', '^SOX'], start=start_date, end=end_date)['Close']
         us_pct = us_data.pct_change().dropna() * 100
         us_pct.columns = ['NDX', 'SOX']
         if us_pct.index.tz is not None: us_pct.index = us_pct.index.tz_localize(None)
 
         # 2. 抓取天天基金网数据
-        url = "http://api.fund.eastmoney.com/f10/lsjz?fundCode=005698&pageIndex=1&pageSize=40"
+        # [修改点2]：将 pageSize 从 40 扩大到 60，确保 API 能往回抓取到 4 月底的数据
+        url = "http://api.fund.eastmoney.com/f10/lsjz?fundCode=005698&pageIndex=1&pageSize=60"
         headers = {"Referer": "http://fundf10.eastmoney.com/"}
         res = requests.get(url, headers=headers, timeout=5).json()
         fund_df = pd.DataFrame(res['Data']['LSJZList'])
@@ -316,7 +320,11 @@ def fetch_ols_data():
 
         final_df = pd.DataFrame(aligned_data).set_index('Date')
         final_df['是否纳入回归'] = True 
-        return final_df.tail(20) # 仅取最近20个有效调仓周期
+        
+        # [修改点3]：取消 .tail(20) 的硬截断，使用日期严格过滤，保留 4.29 至今的所有有效拟合样本
+        final_df = final_df[final_df.index >= start_date]
+        
+        return final_df
     except Exception as e:
         return pd.DataFrame()
 
