@@ -42,7 +42,7 @@ section[data-testid="stSidebar"] * { color: #d1d4dc !important; }
     font-size: 1.8rem !important;
     font-weight: 700 !important;
 }
-[data-testid="stMetricLabel"] { color: #787b86 !important; font-size: 0.75rem !important; font-weight: 600 !important; }
+[data-testid="stMetricLabel"] { color: #787b86 !important; font-size: 0.9rem !important; font-weight: 600 !important; }
 [data-testid="stMetricDelta"] { font-family: 'Courier New', monospace !important; font-weight: 600 !important; }
 
 /* 标题 */
@@ -119,19 +119,20 @@ def dark_layout(height=520, y_range=None, y_title=None, title_text=None):
         height=height,
         paper_bgcolor=C_BG,
         plot_bgcolor=C_PANEL,
-        font=dict(color=C_TEXT, family="Courier New, monospace", size=13),
+        font=dict(color=C_TEXT, family="Courier New, monospace", size=15),
         margin=dict(l=8, r=8, t=30 if title_text else 10, b=8),
         hovermode="x unified",
+        hoverlabel=dict(font_size=15, font_family="Courier New, monospace"),
         showlegend=False,
-        xaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED)),
-        yaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED)),
+        xaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
+        yaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
     )
     if y_range:
         layout["yaxis"]["range"] = y_range
     if y_title:
-        layout["yaxis"]["title"] = dict(text=y_title, font=dict(color=C_MUTED))
+        layout["yaxis"]["title"] = dict(text=y_title, font=dict(color=C_MUTED, size=15))
     if title_text:
-        layout["title"] = dict(text=title_text, font=dict(color=C_TEXT, size=14), x=0, xanchor="left")
+        layout["title"] = dict(text=title_text, font=dict(color=C_TEXT, size=16), x=0, xanchor="left")
     return layout
 
 # ============================================================
@@ -269,7 +270,7 @@ def fetch_ols_data():
     try:
         # 1. 抓取美股两大数据
         end_date = pd.Timestamp.today()
-        # [修改点1]：将动态的 60 天回溯，改为精准锚定今年的 4 月 29 日
+        # 将动态的 60 天回溯，改为精准锚定今年的 4 月 29 日
         current_year = end_date.year
         start_date = pd.Timestamp(f'{current_year}-04-29')
         
@@ -279,7 +280,6 @@ def fetch_ols_data():
         if us_pct.index.tz is not None: us_pct.index = us_pct.index.tz_localize(None)
 
         # 2. 抓取天天基金网数据
-        # [修改点2]：将 pageSize 从 40 扩大到 60，确保 API 能往回抓取到 4 月底的数据
         url = "http://api.fund.eastmoney.com/f10/lsjz?fundCode=005698&pageIndex=1&pageSize=60"
         headers = {"Referer": "http://fundf10.eastmoney.com/"}
         res = requests.get(url, headers=headers, timeout=5).json()
@@ -288,7 +288,7 @@ def fetch_ols_data():
         fund_df['Fund'] = pd.to_numeric(fund_df['JZZZL'], errors='coerce')
         fund_pct = fund_df.set_index('FSRQ')['Fund'].sort_index()
 
-        # 3. 智能假期对齐与复利合并 (核心改进)
+        # 3. 智能假期对齐与复利合并
         df_combined = us_pct.copy()
         df_combined['Fund_Raw'] = fund_pct
         
@@ -322,7 +322,7 @@ def fetch_ols_data():
         final_df = pd.DataFrame(aligned_data).set_index('Date')
         final_df['是否纳入回归'] = True 
         
-        # [修改点3]：取消 .tail(20) 的硬截断，使用日期严格过滤，保留 4.29 至今的所有有效拟合样本
+        # 取消尾部截断，使用日期严格过滤，保留 4.29 至今的所有有效拟合样本
         final_df = final_df[final_df.index >= start_date]
         
         return final_df
@@ -400,7 +400,7 @@ col4.metric(f"📐 历史百分位 (since {history_start})", f"{pct_rank:.1f}%",
 st.markdown("---")
 
 # ============================================================
-# Tabs (新增第三个 Tab)
+# Tabs
 # ============================================================
 tab1, tab2, tab3 = st.tabs(["  📈  综合指数看板  ", "  🔬  历史回测分析  ", "  🔮  华夏净值预测 (OLS)  "])
 
@@ -413,14 +413,14 @@ with tab1:
     # 引入双Y轴
     fig_main = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # 背景色块 (已修复：使用原生 add_shape 强制绑定主Y轴并置于底层)
+    # 背景色块 (完美对齐网格：使用 x domain 约束宽度，避免溢出到次坐标轴区域)
     for y0, y1, fc, op in [
         (90, 100, "#FF0000", 0.12), (80, 90, "#FF4500", 0.08), (70, 80, "#FFA500", 0.06),
         (30, 40,  "#90EE90", 0.06), (20, 30, "#32CD32", 0.10), (0,  20, "#006400", 0.15),
     ]:
         fig_main.add_shape(
             type="rect",
-            xref="paper", x0=0, x1=1,
+            xref="x domain", x0=0, x1=1,
             yref="y", y0=y0, y1=y1,
             fillcolor=fc, opacity=op, layer="below", line_width=0
         )
@@ -439,7 +439,7 @@ with tab1:
         fig_main.add_hline(
             y=y, line_dash=dash, line_color=color, line_width=1.2,
             annotation_text=label, annotation_position=pos,
-            annotation_font_color=color, annotation_font_size=10,
+            annotation_font_color=color, annotation_font_size=13,
             secondary_y=False
         )
 
@@ -465,8 +465,8 @@ with tab1:
     fig_main.update_layout(**layout)
     
     # 独立设置双Y轴的范围和网格显示，防止次坐标轴的网格线干扰画面
-    fig_main.update_yaxes(title_text="泡沫指数 (0-100)", range=[0, 100], secondary_y=False)
-    fig_main.update_yaxes(title_text="纳指 QQQ 价格", showgrid=False, secondary_y=True, tickfont=dict(color='rgba(209, 212, 220, 0.5)'))
+    fig_main.update_yaxes(title_text="泡沫指数 (0-100)", range=[0, 100], secondary_y=False, title_font=dict(size=15), tickfont=dict(size=14))
+    fig_main.update_yaxes(title_text="纳指 QQQ 价格", showgrid=False, secondary_y=True, tickfont=dict(color='rgba(209, 212, 220, 0.5)', size=14), title_font=dict(size=15))
 
     st.plotly_chart(fig_main, use_container_width=True)
 
@@ -500,18 +500,18 @@ with tab1:
         annotation_text=f"当前 {val:.1f}  ({pct_rank:.1f}% 百分位)",
         annotation_position="top right",
         annotation_font_color="#F7DC6F",
-        annotation_font_size=13,
+        annotation_font_size=15,
     )
 
     layout_dist = dark_layout(height=300, y_title="出现天数")
-    layout_dist['xaxis']['title'] = dict(text="泡沫指数值", font=dict(color=C_MUTED))
+    layout_dist['xaxis']['title'] = dict(text="泡沫指数值", font=dict(color=C_MUTED, size=15))
     layout_dist['xaxis']['range'] = [0, 100]
     layout_dist['hovermode'] = "x"
     fig_dist.update_layout(**layout_dist)
     st.plotly_chart(fig_dist, use_container_width=True)
 
     st.markdown(
-        f"<p style='color:#787b86;font-size:0.82rem;'>"
+        f"<p style='color:#787b86;font-size:0.95rem;'>"
         f"基于 {history_start} 至今共 <b style='color:#d1d4dc'>{len(hist_vals)}</b> 个交易日的历史数据。"
         f"当前读数 <b style='color:#F7DC6F'>{val:.1f}</b> 高于历史上 "
         f"<b style='color:#F7DC6F'>{pct_rank:.1f}%</b> 的交易日。</p>",
@@ -550,7 +550,7 @@ with tab1:
 with tab2:
     st.subheader("🔬 历史回测：各泡沫区间买入 QQQ 的历史表现")
     st.markdown(
-        "<p style='color:#787b86;font-size:0.85rem;'>"
+        "<p style='color:#787b86;font-size:0.95rem;'>"
         "统计自 2012 年以来，当泡沫指数处于各区间时买入 QQQ，持有不同周期后的收益情况。"
         "仅供参考，不构成投资建议。</p>",
         unsafe_allow_html=True,
@@ -667,7 +667,7 @@ with tab2:
     st.plotly_chart(fig_multi, use_container_width=True)
 
     st.markdown(
-        "<p style='color:#787b86;font-size:0.8rem;text-align:center;'>"
+        "<p style='color:#787b86;font-size:0.95rem;text-align:center;'>"
         "⚠️ 历史收益不代表未来表现。本看板为个人研究工具，不构成任何投资建议。</p>",
         unsafe_allow_html=True,
     )
@@ -678,7 +678,7 @@ with tab2:
 with tab3:
     st.subheader("🔮 华夏全球科技先锋 (005698) 双因子 OLS 预测")
     st.markdown("""
-    <p style='color:#787b86;font-size:0.9rem;'>
+    <p style='color:#787b86;font-size:1.0rem;'>
     本模块自动抓取近期纳斯达克(NDX)、半导体(SOX)及该基金的实际每日涨跌幅，通过多元线性回归测算基金经理真实的底仓暴露度。
     </p>
     """, unsafe_allow_html=True)
@@ -722,19 +722,19 @@ with tab3:
                 
                 st.markdown("**2. 模型解析出来的真实底仓**")
                 st.info(f"**方程：** 基金收益 = {alpha:.2f}% + ({beta_ndx:.2f} × NDX) + ({beta_sox:.2f} × SOX)")
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("纳指敞口 (Beta)", f"{beta_ndx:.2f}")
-                c2.metric("半导体敞口 (Beta)", f"{beta_sox:.2f}")
-                c3.metric("拟合度 (R²)", f"{model.rsquared:.2f}")
-                
-        st.markdown("---")
-        st.markdown("### 🎯 净值模拟器")
-        
-        latest_dt, auto_ndx, auto_sox = get_latest_market_returns()
-        st.markdown(f"<p style='color:#787b86;font-size:0.85rem;'>🤖 已自动同步美股最新交易日 (<b>{latest_dt}</b>) 的真实收盘数据。你也可以在下方手动修改进行沙盘推演：</p>", unsafe_allow_html=True)
-        
-        pred_col1, pred_col2, pred_col3 = st.columns([1, 1, 1.5])
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("纳指敞口 (Beta)", f"{beta_ndx:.2f}")
+            c2.metric("半导体敞口 (Beta)", f"{beta_sox:.2f}")
+            c3.metric("拟合度 (R²)", f"{model.rsquared:.2f}")
+            
+    st.markdown("---")
+    st.markdown("### 🎯 净值模拟器")
+    
+    latest_dt, auto_ndx, auto_sox = get_latest_market_returns()
+    st.markdown(f"<p style='color:#787b86;font-size:0.95rem;'>🤖 已自动同步美股最新交易日 (<b>{latest_dt}</b>) 的真实收盘数据。你也可以在下方手动修改进行沙盘推演：</p>", unsafe_allow_html=True)
+    
+    pred_col1, pred_col2, pred_col3 = st.columns([1, 1, 1.5])
         with pred_col1:
             in_ndx = st.number_input("👉 当日 NDX 涨跌幅 (%)", value=round(auto_ndx, 2), step=0.1)
         with pred_col2:
