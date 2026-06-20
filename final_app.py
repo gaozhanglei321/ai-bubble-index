@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from scipy.stats import percentileofscore
 from io import StringIO
 import requests
@@ -409,14 +410,15 @@ tab1, tab2, tab3 = st.tabs(["  📈  综合指数看板  ", "  🔬  历史回�
 with tab1:
     st.subheader("🌐 综合指数走势 (战术网格全景)")
 
-    fig_main = go.Figure()
+    # [修改点] 引入双Y轴
+    fig_main = make_subplots(specs=[[{"secondary_y": True}]])
 
     # 背景色块
     for y0, y1, fc, op in [
         (90, 100, "#FF0000", 0.12), (80, 90, "#FF4500", 0.08), (70, 80, "#FFA500", 0.06),
         (30, 40,  "#90EE90", 0.06), (20, 30, "#32CD32", 0.10), (0,  20, "#006400", 0.15),
     ]:
-        fig_main.add_hrect(y0=y0, y1=y1, line_width=0, fillcolor=fc, opacity=op)
+        fig_main.add_hrect(y0=y0, y1=y1, line_width=0, fillcolor=fc, opacity=op, secondary_y=False)
 
     # 水位网格线
     for y, label, color, dash in [
@@ -433,18 +435,34 @@ with tab1:
             y=y, line_dash=dash, line_color=color, line_width=1.2,
             annotation_text=label, annotation_position=pos,
             annotation_font_color=color, annotation_font_size=10,
+            secondary_y=False
         )
 
-    # 主曲线
+    # [新增] 纳指100 (QQQ) 作为背景山脉图 (次坐标轴)
+    fig_main.add_trace(go.Scatter(
+        x=plot_df.index, y=plot_df['QQQ'],
+        mode='lines', name='纳指100 (QQQ)',
+        line=dict(color='rgba(209, 212, 220, 0.25)', width=1.5), # 半透明的灰白线
+        fill='tozeroy', fillcolor='rgba(209, 212, 220, 0.05)',   # 极淡的背景填充
+        hovertemplate='纳指QQQ: $%{y:.2f}<extra></extra>',
+    ), secondary_y=True)
+
+    # 主曲线 (主坐标轴)
     fig_main.add_trace(go.Scatter(
         x=plot_df.index, y=plot_df['总泡沫指数'],
         mode='lines', name='泡沫指数',
         line=dict(color=C_BLUE, width=2.5),
-        hovertemplate='日期: %{x|%Y-%m-%d}<br>指数: %{y:.2f}<extra></extra>',
-    ))
+        hovertemplate='日期: %{x|%Y-%m-%d}<br>泡沫指数: %{y:.2f}<extra></extra>',
+    ), secondary_y=False)
 
-    layout = dark_layout(height=530, y_range=[0, 100])
+    # 更新布局
+    layout = dark_layout(height=530)
     fig_main.update_layout(**layout)
+    
+    # [修改点] 独立设置双Y轴的范围和网格显示，防止次坐标轴的网格线干扰画面
+    fig_main.update_yaxes(title_text="泡沫指数 (0-100)", range=[0, 100], secondary_y=False)
+    fig_main.update_yaxes(title_text="纳指 QQQ 价格", showgrid=False, secondary_y=True, tickfont=dict(color='rgba(209, 212, 220, 0.5)'))
+
     st.plotly_chart(fig_main, use_container_width=True)
 
     # 历史分布图
@@ -555,9 +573,9 @@ with tab2:
     # ── 选择持有周期 ──
     selected = st.selectbox("📅 选择持有周期查看详细图表", [p[0] for p in PERIODS], index=2)
 
-    avgs   = [r.get(f'{selected}_avg',    np.nan) for r in results]
+    avgs   = [r.get(f'{selected}_avg',     np.nan) for r in results]
     meds   = [r.get(f'{selected}_median', np.nan) for r in results]
-    wins   = [r.get(f'{selected}_win',    np.nan) for r in results]
+    wins   = [r.get(f'{selected}_win',     np.nan) for r in results]
     labels = [r['区间'] for r in results]
 
     # ── 均值 vs 中位数收益 ──
