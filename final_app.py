@@ -723,10 +723,10 @@ with tab3:
                 st.markdown("**2. 模型解析出来的真实底仓**")
                 st.info(f"**方程：** 基金收益 = {alpha:.2f}% + ({beta_ndx:.2f} × NDX) + ({beta_sox:.2f} × SOX)")
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("纳指敞口 (Beta)", f"{beta_ndx:.2f}")
-            c2.metric("半导体敞口 (Beta)", f"{beta_sox:.2f}")
-            c3.metric("拟合度 (R²)", f"{model.rsquared:.2f}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("纳指敞口 (Beta)", f"{beta_ndx:.2f}")
+                c2.metric("半导体敞口 (Beta)", f"{beta_sox:.2f}")
+                c3.metric("拟合度 (R²)", f"{model.rsquared:.2f}")
             
     st.markdown("---")
     st.markdown("### 🎯 净值模拟器")
@@ -735,20 +735,20 @@ with tab3:
     st.markdown(f"<p style='color:#787b86;font-size:0.95rem;'>🤖 已自动同步美股最新交易日 (<b>{latest_dt}</b>) 的真实收盘数据。你也可以在下方手动修改进行沙盘推演：</p>", unsafe_allow_html=True)
     
     pred_col1, pred_col2, pred_col3 = st.columns([1, 1, 1.5])
-        with pred_col1:
-            in_ndx = st.number_input("👉 当日 NDX 涨跌幅 (%)", value=round(auto_ndx, 2), step=0.1)
-        with pred_col2:
-            in_sox = st.number_input("👉 当日 SOX 涨跌幅 (%)", value=round(auto_sox, 2), step=0.1)
-            
-        if len(valid_data) >= 5:
-            pred_val = alpha + beta_ndx * in_ndx + beta_sox * in_sox
-            pred_se = np.sqrt(model.mse_resid) 
-            
-            with pred_col3:
-                st.markdown("**95% 置信区间预测结果：**")
-                st.metric(
-                    "核心预测值", 
-                    f"{pred_val:.2f}%", 
-                    f"波动范围: [{pred_val - 1.96*pred_se:.2f}%, {pred_val + 1.96*pred_se:.2f}%]", 
-                    delta_color="off"
-                )
+    with pred_col1:
+        in_ndx = st.number_input("👉 当日 NDX 涨跌幅 (%)", value=round(auto_ndx, 2), step=0.1)
+    with pred_col2:
+        in_sox = st.number_input("👉 当日 SOX 涨跌幅 (%)", value=round(auto_sox, 2), step=0.1)
+        
+    if len(valid_data) >= 5:
+        pred_val = alpha + beta_ndx * in_ndx + beta_sox * in_sox
+        pred_se = np.sqrt(model.mse_resid) 
+        
+        with pred_col3:
+            st.markdown("**95% 置信区间预测结果：**")
+            st.metric(
+                "核心预测值", 
+                f"{pred_val:.2f}%", 
+                f"波动范围: [{pred_val - 1.96*pred_se:.2f}%, {pred_val + 1.96*pred_se:.2f}%]", 
+                delta_color="off"
+            )
