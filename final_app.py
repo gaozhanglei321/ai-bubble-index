@@ -106,7 +106,8 @@ ZONES = [
     (0,  20,  "💎 史诗底部 (0-20)",   "#34C759"),
     (20, 30,  "🟩 恐慌底部 (20-30)",  "#30D158"),
     (30, 40,  "🟢 偏低区域 (30-40)",  "#90EE90"),
-    (40, 70,  "🟡 中性震荡 (40-70)",  "#FFD700"),
+    (40, 51,  "📉 趋势破位区 (40-51)",  "#D4AC0D"),
+    (51, 70,  "⚠️ 派发震荡区 (51-70)",  "#F7DC6F"),
     (70, 80,  "🟠 偏高区域 (70-80)",  "#FF9F0A"),
     (80, 90,  "🔴 高风险区 (80-90)",  "#FF6B35"),
     (90, 101, "🚨 极度危险 (90+)",    "#FF3B30"),
@@ -366,14 +367,15 @@ st.sidebar.header("⚙️ 看板控制台")
 days = st.sidebar.slider("时间轴范围 (天)", 100, 1500, 400)
 plot_df = df.tail(days)
 
-# 当前状态
+# 当前状态 (结合最新的 51-66 派发与破位法则)
 val   = float(plot_df['总泡沫指数'].iloc[-1])
 delta = val - float(plot_df['总泡沫指数'].iloc[-2]) if len(plot_df) > 1 else 0.0
 
 if   val >= 90: status, emoji = "极度危险 (高度警戒/清仓)", "🚨"
 elif val >= 80: status, emoji = "高风险区 (建议逐步减仓)", "🔴"
 elif val >= 70: status, emoji = "偏高区域 (暂停定投/观望)", "🟠"
-elif val >= 40: status, emoji = "中性震荡 (持有/观望状态)", "🟡"
+elif val >= 51: status, emoji = "高位派发震荡 (警惕顶背离)", "⚠️"
+elif val >= 40: status, emoji = "趋势向下破位 (防守/寻底)", "📉"
 elif val >= 30: status, emoji = "偏低区域 (推荐开启定投)", "🟢"
 elif val >= 20: status, emoji = "恐慌底部 (建议加大定投)", "🟩"
 else:           status, emoji = "史诗级大底 (黄金坑/梭哈)", "💎"
@@ -416,6 +418,7 @@ with tab1:
     # 背景色块 (完美对齐网格：使用 x domain 约束宽度，避免溢出到次坐标轴区域)
     for y0, y1, fc, op in [
         (90, 100, "#FF0000", 0.12), (80, 90, "#FF4500", 0.08), (70, 80, "#FFA500", 0.06),
+        (51, 70,  "#F7DC6F", 0.04), (40, 51, "#D4AC0D", 0.06), # 新增 51 分界线的高危派发区背景
         (30, 40,  "#90EE90", 0.06), (20, 30, "#32CD32", 0.10), (0,  20, "#006400", 0.15),
     ]:
         fig_main.add_shape(
@@ -425,19 +428,20 @@ with tab1:
             fillcolor=fc, opacity=op, layer="below", line_width=0
         )
 
-    # 水位网格线
+    # 水位网格线 (更新了 51 和 66 的法则线)
     for y, label, color, dash in [
         (90, "清仓线 (90)",  "#FF3B30", "solid"),
         (80, "减仓线 (80)",  "#FF6B35", "dash"),
         (70, "停投线 (70)",  "#FF9F0A", "dot"),
-        (50, "中轴线 (50)",  C_MUTED,   "dash"),
+        (66, "顶背离警戒线 (66)", "#F7DC6F", "dot"),
+        (51, "牛熊破位线 (51)", "#FF4500", "dash"),
         (40, "开启定投 (40)","#30D158", "dot"),
         (30, "加大定投 (30)","#34C759", "dash"),
         (20, "梭哈底线 (20)","#30D158", "solid"),
     ]:
-        pos = "top left" if y >= 50 else "bottom left"
+        pos = "top left" if y >= 51 else "bottom left"
         fig_main.add_hline(
-            y=y, line_dash=dash, line_color=color, line_width=1.2,
+            y=y, line_dash=dash, line_color=color, line_width=1.5 if y == 51 else 1.2, # 51加粗强调
             annotation_text=label, annotation_position=pos,
             annotation_font_color=color, annotation_font_size=13,
             secondary_y=False
@@ -481,6 +485,7 @@ with tab1:
     # 背景色块（和主图一致）
     for y0, y1, fc, op in [
         (90, 100, "#FF0000", 0.10), (80, 90, "#FF4500", 0.07), (70, 80, "#FFA500", 0.05),
+        (51, 70,  "#F7DC6F", 0.03), (40, 51, "#D4AC0D", 0.05),
         (30, 40, "#90EE90", 0.05),  (20, 30, "#32CD32", 0.08), (0, 20, "#006400", 0.12),
     ]:
         fig_dist.add_vrect(x0=y0, x1=y1, line_width=0, fillcolor=fc, opacity=op)
