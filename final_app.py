@@ -103,14 +103,14 @@ C_TEXT     = "#d1d4dc"
 C_MUTED    = "#787b86"
 
 ZONES = [
-    (0,  20,  "💎 史诗底部 (0-20)",   "#34C759"),
-    (20, 30,  "🟩 恐慌底部 (20-30)",  "#30D158"),
-    (30, 40,  "🟢 偏低区域 (30-40)",  "#90EE90"),
-    (40, 51,  "📉 趋势破位区 (40-51)",  "#D4AC0D"),
-    (51, 70,  "⚠️ 派发震荡区 (51-70)",  "#F7DC6F"),
-    (70, 80,  "🟠 偏高区域 (70-80)",  "#FF9F0A"),
-    (80, 90,  "🔴 高风险区 (80-90)",  "#FF6B35"),
-    (90, 101, "🚨 极度危险 (90+)",    "#FF3B30"),
+    (0,   33,  "💎 极限大底/重仓 (<33)",  "#00FFFF"), 
+    (33,  39,  "🟩 大幅加仓机会 (33-39)", "#32CD32"),
+    (39,  41.5,"🟢 优质定投区域 (39-41.5)","#90EE90"),
+    (41.5,45,  "🟡 恐慌底部分界 (41.5-45)","#FFD700"),
+    (45,  52,  "📉 趋势变坏/下行 (45-52)", "#FF3B30"),
+    (52,  60,  "⚠️ 高位背离警告 (52-60)", "#FF9F0A"),
+    (60,  75,  "🔵 合理价位/持有 (60-75)", "#2962ff"),
+    (75,  101, "🚨 估值偏高/警惕 (>75)",   "#F7DC6F"),
 ]
 PERIODS = [("1个月", 21), ("3个月", 63), ("6个月", 126), ("1年", 252)]
 
@@ -213,6 +213,9 @@ def fetch_and_calculate():
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
     df.index.name = '日期'
+
+    # [新增] 计算 QQQ 1周(5个交易日)动量，用于识别破位下跌趋势
+    df['QQQ_1w_ret'] = df['QQQ'].pct_change(5).fillna(0)
 
     return df
 
@@ -365,20 +368,44 @@ if df.empty:
 # 侧边栏
 st.sidebar.header("⚙️ 看板控制台")
 days = st.sidebar.slider("时间轴范围 (天)", 100, 1500, 400)
-plot_df = df.tail(days)
+plot_df = df.tail(days).copy()
 
-# 当前状态 (结合最新的 51-66 派发与破位法则)
+# ============================================================
+# 计算动态线段颜色
+# ============================================================
+line_colors = []
+for i in range(len(plot_df)):
+    v = plot_df['总泡沫指数'].iloc[i]
+    r = plot_df['QQQ_1w_ret'].iloc[i]
+    
+    if v > 75:     c = "#F7DC6F" # 淡黄 (风险)
+    elif v > 60:   c = "#2962ff" # 蓝 (合理)
+    elif v > 52:   c = "#FF9F0A" # 橙 (背离警告)
+    elif v > 45:   c = "#FF3B30" if r < 0 else "#FF9F0A" # 红 (跌破52且下降=破位) or 橙
+    elif v > 41.5: c = "#FFD700" # 黄 (恐慌底部)
+    elif v > 39:   c = "#90EE90" # 淡绿 (定投机会)
+    elif v > 33:   c = "#32CD32" # 纯绿 (分批买入)
+    else:          c = "#00FFFF" # 青色 (极限大底)
+    
+    line_colors.append(c)
+
+plot_df['Line_Color'] = line_colors
+
+# 当前状态 (结合全新变色警戒法则)
 val   = float(plot_df['总泡沫指数'].iloc[-1])
+ret_1w = float(plot_df['QQQ_1w_ret'].iloc[-1])
 delta = val - float(plot_df['总泡沫指数'].iloc[-2]) if len(plot_df) > 1 else 0.0
 
-if   val >= 90: status, emoji = "极度危险 (高度警戒/清仓)", "🚨"
-elif val >= 80: status, emoji = "高风险区 (建议逐步减仓)", "🔴"
-elif val >= 70: status, emoji = "偏高区域 (暂停定投/观望)", "🟠"
-elif val >= 51: status, emoji = "高位派发震荡 (警惕顶背离)", "⚠️"
-elif val >= 40: status, emoji = "趋势向下破位 (防守/寻底)", "📉"
-elif val >= 30: status, emoji = "偏低区域 (推荐开启定投)", "🟢"
-elif val >= 20: status, emoji = "恐慌底部 (建议加大定投)", "🟩"
-else:           status, emoji = "史诗级大底 (黄金坑/梭哈)", "💎"
+if   val > 75:   status, emoji = "估值偏高 (提示风险/谨慎)", "🚨"
+elif val > 60:   status, emoji = "合理价位 (正常持有状态)", "🔵"
+elif val > 52:   status, emoji = "高位背离 (警惕动量衰竭)", "⚠️"
+elif val > 45: 
+    if ret_1w < 0: status, emoji = "趋势变坏 (市场开始下跌)", "📉"
+    else:          status, emoji = "跌破防线 (趋势转弱观望)", "📉"
+elif val > 41.5: status, emoji = "恐慌发酵 (底部酝酿中)", "🟡"
+elif val > 39:   status, emoji = "定投机会 (大资金开启定投)", "🟢"
+elif val > 33:   status, emoji = "大底区间 (大额分批买入)", "🟩"
+else:            status, emoji = "极限大底 (降低现金重仓进入)", "💎"
 
 # 历史百分位（基于全量历史，不受滑块影响）
 all_vals = df['总泡沫指数'].dropna().values
@@ -415,11 +442,16 @@ with tab1:
     # 引入双Y轴
     fig_main = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # 背景色块 (完美对齐网格：使用 x domain 约束宽度，避免溢出到次坐标轴区域)
+    # 背景色块 (完美对齐新区间，约束宽度避免溢出)
     for y0, y1, fc, op in [
-        (90, 100, "#FF0000", 0.12), (80, 90, "#FF4500", 0.08), (70, 80, "#FFA500", 0.06),
-        (51, 70,  "#F7DC6F", 0.04), (40, 51, "#D4AC0D", 0.06), # 新增 51 分界线的高危派发区背景
-        (30, 40,  "#90EE90", 0.06), (20, 30, "#32CD32", 0.10), (0,  20, "#006400", 0.15),
+        (75, 100,  "#F7DC6F", 0.05), # 淡黄
+        (60, 75,   "#2962ff", 0.03), # 蓝
+        (52, 60,   "#FF9F0A", 0.04), # 橙
+        (45, 52,   "#FF3B30", 0.05), # 红
+        (41.5, 45, "#FFD700", 0.06), # 黄
+        (39, 41.5, "#90EE90", 0.08), # 淡绿
+        (33, 39,   "#32CD32", 0.10), # 纯绿
+        (0,  33,   "#00FFFF", 0.12), # 青色
     ]:
         fig_main.add_shape(
             type="rect",
@@ -428,20 +460,19 @@ with tab1:
             fillcolor=fc, opacity=op, layer="below", line_width=0
         )
 
-    # 水位网格线 (更新了 51 和 66 的法则线)
+    # 水位网格线 (更新为全新的战术分界线)
     for y, label, color, dash in [
-        (90, "清仓线 (90)",  "#FF3B30", "solid"),
-        (80, "减仓线 (80)",  "#FF6B35", "dash"),
-        (70, "停投线 (70)",  "#FF9F0A", "dot"),
-        (66, "顶背离警戒线 (66)", "#F7DC6F", "dot"),
-        (51, "牛熊破位线 (51)", "#FF4500", "dash"),
-        (40, "开启定投 (40)","#30D158", "dot"),
-        (30, "加大定投 (30)","#34C759", "dash"),
-        (20, "梭哈底线 (20)","#30D158", "solid"),
+        (75, "风险警惕线 (75)",   "#F7DC6F", "solid"),
+        (60, "合理估值上限 (60)", "#2962ff", "dash"),
+        (52, "趋势破位线 (52)",   "#FF9F0A", "dot"),
+        (45, "恐慌底部分界 (45)", "#FFD700", "dash"),
+        (41.5, "优质定投线 (41.5)", "#90EE90", "dot"),
+        (39, "大额买入线 (39)",   "#32CD32", "dash"),
+        (33, "极限重仓线 (33)",   "#00FFFF", "solid"),
     ]:
-        pos = "top left" if y >= 51 else "bottom left"
+        pos = "top left" if y >= 52 else "bottom left"
         fig_main.add_hline(
-            y=y, line_dash=dash, line_color=color, line_width=1.5 if y == 51 else 1.2, # 51加粗强调
+            y=y, line_dash=dash, line_color=color, line_width=1.5 if y in [60, 45] else 1.2,
             annotation_text=label, annotation_position=pos,
             annotation_font_color=color, annotation_font_size=13,
             secondary_y=False
@@ -451,16 +482,42 @@ with tab1:
     fig_main.add_trace(go.Scatter(
         x=plot_df.index, y=plot_df['QQQ'],
         mode='lines', name='纳指100 (QQQ)',
-        line=dict(color='rgba(209, 212, 220, 0.25)', width=1.5), # 半透明的灰白线
-        fill='tozeroy', fillcolor='rgba(209, 212, 220, 0.05)',   # 极淡的背景填充
+        line=dict(color='rgba(209, 212, 220, 0.25)', width=1.5), 
+        fill='tozeroy', fillcolor='rgba(209, 212, 220, 0.05)',   
         hovertemplate='纳指QQQ: $%{y:.2f}<extra></extra>',
     ), secondary_y=True)
 
-    # 主曲线 (主坐标轴)
+    # 分段绘制主曲线（实现动态变色）
+    current_color = plot_df['Line_Color'].iloc[0]
+    segment_x = [plot_df.index[0]]
+    segment_y = [plot_df['总泡沫指数'].iloc[0]]
+
+    for i in range(1, len(plot_df)):
+        x = plot_df.index[i]
+        y = plot_df['总泡沫指数'].iloc[i]
+        c = plot_df['Line_Color'].iloc[i]
+        
+        segment_x.append(x)
+        segment_y.append(y)
+        
+        if c != current_color or i == len(plot_df) - 1:
+            fig_main.add_trace(go.Scatter(
+                x=segment_x, y=segment_y,
+                mode='lines',
+                line=dict(color=current_color, width=3.0), # 稍微加粗，增强色彩视觉
+                showlegend=False,
+                hoverinfo='skip' # 禁用分段的悬停，使用下方隐形统一线
+            ), secondary_y=False)
+            
+            current_color = c
+            segment_x = [x]
+            segment_y = [y]
+
+    # 添加一层全透明的完整隐形线，专门用于触发完美的悬停(Hover)效果
     fig_main.add_trace(go.Scatter(
         x=plot_df.index, y=plot_df['总泡沫指数'],
         mode='lines', name='泡沫指数',
-        line=dict(color=C_BLUE, width=2.5),
+        line=dict(color='rgba(0,0,0,0)', width=0.1),
         hovertemplate='日期: %{x|%Y-%m-%d}<br>泡沫指数: %{y:.2f}<extra></extra>',
     ), secondary_y=False)
 
@@ -482,11 +539,16 @@ with tab1:
 
     fig_dist = go.Figure()
 
-    # 背景色块（和主图一致）
+    # 背景色块（和主图一致同步更新）
     for y0, y1, fc, op in [
-        (90, 100, "#FF0000", 0.10), (80, 90, "#FF4500", 0.07), (70, 80, "#FFA500", 0.05),
-        (51, 70,  "#F7DC6F", 0.03), (40, 51, "#D4AC0D", 0.05),
-        (30, 40, "#90EE90", 0.05),  (20, 30, "#32CD32", 0.08), (0, 20, "#006400", 0.12),
+        (75, 100,  "#F7DC6F", 0.05),
+        (60, 75,   "#2962ff", 0.03),
+        (52, 60,   "#FF9F0A", 0.04),
+        (45, 52,   "#FF3B30", 0.05), 
+        (41.5, 45, "#FFD700", 0.06),
+        (39, 41.5, "#90EE90", 0.08),
+        (33, 39,   "#32CD32", 0.10),
+        (0,  33,   "#00FFFF", 0.12),
     ]:
         fig_dist.add_vrect(x0=y0, x1=y1, line_width=0, fillcolor=fc, opacity=op)
 
