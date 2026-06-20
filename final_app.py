@@ -410,15 +410,20 @@ tab1, tab2, tab3 = st.tabs(["  📈  综合指数看板  ", "  🔬  历史回�
 with tab1:
     st.subheader("🌐 综合指数走势 (战术网格全景)")
 
-    # [修改点] 引入双Y轴
+    # 引入双Y轴
     fig_main = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # 背景色块
+    # 背景色块 (已修复：使用原生 add_shape 强制绑定主Y轴并置于底层)
     for y0, y1, fc, op in [
         (90, 100, "#FF0000", 0.12), (80, 90, "#FF4500", 0.08), (70, 80, "#FFA500", 0.06),
         (30, 40,  "#90EE90", 0.06), (20, 30, "#32CD32", 0.10), (0,  20, "#006400", 0.15),
     ]:
-        fig_main.add_hrect(y0=y0, y1=y1, line_width=0, fillcolor=fc, opacity=op, secondary_y=False)
+        fig_main.add_shape(
+            type="rect",
+            xref="paper", x0=0, x1=1,
+            yref="y", y0=y0, y1=y1,
+            fillcolor=fc, opacity=op, layer="below", line_width=0
+        )
 
     # 水位网格线
     for y, label, color, dash in [
@@ -438,7 +443,7 @@ with tab1:
             secondary_y=False
         )
 
-    # [新增] 纳指100 (QQQ) 作为背景山脉图 (次坐标轴)
+    # 纳指100 (QQQ) 作为背景山脉图 (次坐标轴)
     fig_main.add_trace(go.Scatter(
         x=plot_df.index, y=plot_df['QQQ'],
         mode='lines', name='纳指100 (QQQ)',
@@ -459,7 +464,7 @@ with tab1:
     layout = dark_layout(height=530)
     fig_main.update_layout(**layout)
     
-    # [修改点] 独立设置双Y轴的范围和网格显示，防止次坐标轴的网格线干扰画面
+    # 独立设置双Y轴的范围和网格显示，防止次坐标轴的网格线干扰画面
     fig_main.update_yaxes(title_text="泡沫指数 (0-100)", range=[0, 100], secondary_y=False)
     fig_main.update_yaxes(title_text="纳指 QQQ 价格", showgrid=False, secondary_y=True, tickfont=dict(color='rgba(209, 212, 220, 0.5)'))
 
