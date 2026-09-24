@@ -1,3 +1,12 @@
+"""AI bubble dashboard V3.1 / 完整模型与早期参考历史分开统计。"""
+import json
+import hashlib
+import os
+import zipfile
+from pathlib import Path
+from datetime import datetime, timezone
+from io import BytesIO, StringIO
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -5,270 +14,488 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.stats import percentileofscore
-from io import StringIO
 import requests
 import statsmodels.api as sm
 
-# ============================================================
-# 全局配置
-# ============================================================
-st.set_page_config(page_title="AI泡沫指数终极看板", page_icon="📈", layout="wide")
-
-# ============================================================
-# Bloomberg / TradingView 深色主题 CSS
-# ============================================================
-st.markdown("""
-<style>
-/* 主背景 */
-.stApp { background-color: #131722; color: #d1d4dc; }
-
-/* 侧边栏 */
-section[data-testid="stSidebar"] {
-    background-color: #1e222d;
-    border-right: 1px solid #2a2e39;
+# 用户配置 / User configuration: complete-model formula is unchanged.
+USER_CONFIG = {
+    "START_DATE": "1960-01-01",
+    "BIAS_POINTS": 15.0,  # 人工风险修正 / Required manual risk adjustment
+    "CACHE_SECONDS": 3600,
+    "MISSING_POLICY": "legacy",  # legacy 保持原版前向填充；strict 不补值（会改变部分读数）
+    "SAVE_LOCAL_BACKUP": True,
+    "BACKUP_DIR": "bubble_data",  # Relative to this script, not the working directory
 }
-section[data-testid="stSidebar"] * { color: #d1d4dc !important; }
-
-/* 指标卡片 */
-[data-testid="metric-container"] {
-    background-color: #1e222d;
-    border: 1px solid #2a2e39;
-    border-radius: 8px;
-    padding: 16px 20px;
+MODEL_VERSION = "3.1-full-and-reference"
+TICKERS = ["QQQ", "^VIX", "SPHB", "SPLV", "IPO", "SPY", "HYG", "IEF", "^TNX"]
+FACTOR_NAMES = {
+    "P1": "QQQ 均线偏离", "P2": "VIX 倒数", "P3": "高低波动比",
+    "P4": "IPO 表现与成交量", "P5": "HYG/IEF", "P6": "美债收益率动量",
 }
-[data-testid="stMetricValue"] {
-    color: #d1d4dc !important;
-    font-family: 'Courier New', monospace !important;
-    font-size: 1.8rem !important;
-    font-weight: 700 !important;
-}
-[data-testid="stMetricLabel"] { color: #787b86 !important; font-size: 0.9rem !important; font-weight: 600 !important; }
-[data-testid="stMetricDelta"] { font-family: 'Courier New', monospace !important; font-weight: 600 !important; }
+SENTIMENT_WEIGHTS = pd.Series({"P1": .3, "P2": .3, "P3": .1, "P4": .3})
+CAPITAL_WEIGHTS = pd.Series({"P5": .5, "P6": .5})
+BACKUP_DIR = Path(__file__).resolve().parent / USER_CONFIG["BACKUP_DIR"]
 
-/* 标题 */
-h1, h2, h3 { color: #d1d4dc !important; }
-h1 { font-family: 'Courier New', monospace !important; border-bottom: 1px solid #2a2e39; padding-bottom: 8px; }
 
-/* 分割线 */
-hr { border-color: #2a2e39 !important; }
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] {
-    background-color: #1e222d;
-    border-bottom: 1px solid #2a2e39;
-    gap: 4px;
-}
-.stTabs [data-baseweb="tab"] {
-    color: #787b86;
-    background-color: transparent;
-    border-radius: 6px 6px 0 0;
-    padding: 8px 20px;
-    font-family: 'Courier New', monospace;
-}
-.stTabs [aria-selected="true"] {
-    color: #2962ff !important;
-    border-bottom: 2px solid #2962ff !important;
-    background-color: rgba(41,98,255,0.08) !important;
-}
-
-/* Selectbox / Dropdown */
-[data-baseweb="select"] { background-color: #1e222d !important; border-color: #2a2e39 !important; }
-[data-baseweb="select"] * { color: #d1d4dc !important; background-color: #1e222d !important; }
-
-/* Dataframe */
-[data-testid="stDataFrame"] { border: 1px solid #2a2e39; border-radius: 6px; }
-
-/* Spinner */
-.stSpinner > div { border-top-color: #2962ff !important; }
-
-/* Slider */
-[data-testid="stSlider"] [data-baseweb="slider"] [role="slider"] {
-    background-color: #2962ff !important;
-    border-color: #2962ff !important;
-}
-
-/* Markdown */
-.stMarkdown, p { color: #d1d4dc !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ============================================================
-# 设计常量
-# ============================================================
-C_BG       = "#131722"
-C_PANEL    = "#1e222d"
-C_BORDER   = "#2a2e39"
-C_BLUE     = "#2962ff"
-C_TEXT     = "#d1d4dc"
-C_MUTED    = "#787b86"
-
-ZONES = [
-    (0,   33,  "💎 极限大底/重仓 (<33)",  "#00FFFF"), 
-    (33,  39,  "🟩 大幅加仓机会 (33-39)", "#32CD32"),
-    (39,  41.5,"🟢 优质定投区域 (39-41.5)","#90EE90"),
-    (41.5,45,  "🟡 恐慌底部分界 (41.5-45)","#FFD700"),
-    (45,  52,  "📉 趋势变坏/下行 (45-52)", "#FF3B30"),
-    (52,  60,  "⚠️ 高位背离警告 (52-60)", "#FF9F0A"),
-    (60,  75,  "🔵 合理价位/持有 (60-75)", "#2962ff"),
-    (75,  101, "🚨 估值偏高/警惕 (>75)",   "#F7DC6F"),
-]
-PERIODS = [("1个月", 21), ("3个月", 63), ("6个月", 126), ("1年", 252)]
-
-def dark_layout(height=520, y_range=None, y_title=None, title_text=None):
-    """返回统一的深色 Plotly 布局字典"""
-    layout = dict(
-        height=height,
-        paper_bgcolor=C_BG,
-        plot_bgcolor=C_PANEL,
-        font=dict(color=C_TEXT, family="Courier New, monospace", size=15),
-        margin=dict(l=8, r=8, t=30 if title_text else 10, b=8),
-        hovermode="x unified",
-        hoverlabel=dict(font_size=15, font_family="Courier New, monospace"),
-        showlegend=False,
-        xaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
-        yaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
-    )
-    if y_range:
-        layout["yaxis"]["range"] = y_range
-    if y_title:
-        layout["yaxis"]["title"] = dict(text=y_title, font=dict(color=C_MUTED, size=15))
-    if title_text:
-        layout["title"] = dict(text=title_text, font=dict(color=C_TEXT, size=16), x=0, xanchor="left")
-    return layout
-
-# ============================================================
-# 数据获取 & 计算（完全还原你的原始手工调校逻辑）
-# ============================================================
-@st.cache_data(ttl=3600)
-def fetch_and_calculate():
-    # 1. 下载底层数据
-    tickers = ["QQQ", "^VIX", "SPHB", "SPLV", "IPO", "SPY", "HYG", "IEF", "^TNX"]
-    raw = yf.download(tickers, start="2012-01-01")
-    close = raw['Close'].ffill()
-    volume = raw['Volume'].ffill()
-
-    def get_pct(series, window):
-        return series.rolling(window).apply(
-            lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100 if len(x) >= window / 2 else np.nan)
-
-    # ==========================================
-    # 模块一：情绪指标 (P1 - P4)
-    # ==========================================
-    sma200 = close['QQQ'].rolling(200).mean()
-    p1 = get_pct((close['QQQ'] - sma200) / sma200, 2520)
-
-    p2 = get_pct(1 / close['^VIX'], 2520)
-
-    p3_raw = get_pct(close['SPHB'] / close['SPLV'], 756)
-    p3 = 50 + (p3_raw - 50) * 0.4  # 恢复原版压缩系数
-
-    p4_enhanced = (close['IPO'] / close['SPY']) * (volume['IPO'] / volume['IPO'].rolling(126).mean())
-    p4 = get_pct(p4_enhanced, 756)
-
-    # 情绪合成 (保留调校魔法)
-    sentiment_raw = p1 * 0.3 + p2 * 0.3 + p3 * 0.1 + p4 * 0.3
-    sentiment_smoothed = sentiment_raw.rolling(10).mean()
-    sentiment_index = 20 + (sentiment_smoothed - 20) * 0.83  # 恢复原版压缩系数
-
-    # ==========================================
-    # 模块二：资金指标 (P5 - P6)
-    # ==========================================
-    # P5 流动性 (高低利差平替)
-    p5_raw = get_pct(close['HYG'] / close['IEF'], 756).rolling(10).mean()
-    p5_final = (80 - (100 - p5_raw) * 3.0).clip(lower=0, upper=100)
-
-    # P6 降息预期 (美债收益率动量阶梯化)
-    tnx_change = close['^TNX'] - close['^TNX'].shift(20)
-    smoothed_change = tnx_change.rolling(10).mean()
-
-    def step_fn(c):
-        if pd.isna(c): return np.nan
-        if c < -0.25: return 100
-        elif c < -0.05: return 75
-        elif c < 0.15: return 50
-        else: return 25
-
-    p6_final = smoothed_change.apply(step_fn).ffill()
-
-    # 资金合成 (等权结合 P5 和 P6)
-    capital_index = (p5_final + p6_final) / 2
-
-    # ==========================================
-    # 🚀 终极总合成：情绪 vs 资金 = 2 : 1
-    # ==========================================
-    total_index = (sentiment_index * 2 + capital_index * 1) / 3
-    total_smoothed = total_index.rolling(10).mean()
-    
-    # 🚀 最终修正魔法：完全还原你的 +15 曲线上移逻辑，拒绝盲目归一化导致局部的低点变成绝对恐慌。
-    total_smoothed = (total_smoothed + 15).clip(lower=0, upper=100)
-
-    df = pd.DataFrame({
-        '总泡沫指数': total_smoothed,
-        '综合情绪指标': sentiment_index,
-        '综合资金指标': capital_index,
-        'QQQ': close['QQQ'],  # 保留 QQQ，供回测模块使用
-    }).dropna()
-
-    # 清理时区并修改索引名称为中文
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    df.index.name = '日期'
-
-    # [新增] 计算 QQQ 1周(5个交易日)动量，用于识别破位下跌趋势
-    df['QQQ_1w_ret'] = df['QQQ'].pct_change(5).fillna(0)
-
-    return df
-
-# ============================================================
-# 回测核心逻辑
-# ============================================================
-@st.cache_data(ttl=3600)
-def run_backtest(df_json: str) -> list[dict]:
+def normalize_raw(raw):
+    """Validate a complete download schema without filling missing observations.
+    校验字段；上市前和下载缺失值保持为空，不以其他标的代替。
     """
-    接收 JSON 字符串以规避 Streamlit 无法哈希 DataFrame 的问题。
-    返回各区间各周期的统计结果列表。
-    """
-    df = pd.read_json(StringIO(df_json))
-    df.index = pd.to_datetime(df.index, unit='ms')
-    df.index.name = '日期'
+    if raw is None or raw.empty or not isinstance(raw.columns, pd.MultiIndex):
+        raise ValueError("未获得有效的多标的行情表。")
+    out = raw.copy()
+    if "Close" not in out.columns.get_level_values(0):
+        if "Close" in out.columns.get_level_values(1):
+            out = out.swaplevel(axis=1)
+        else:
+            raise ValueError("行情缺少 Close 字段。")
+    required = [("Close", t) for t in TICKERS] + [("Volume", "IPO")]
+    missing = [f"{f}/{t}" for f, t in required
+               if (f, t) not in out or out[(f, t)].notna().sum() == 0]
+    if missing:
+        raise ValueError("行情下载不完整，拒绝按早期模型降级：" + ", ".join(missing))
+    out.index = pd.to_datetime(out.index)
+    if out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    out.index = out.index.normalize().as_unit("ns")
+    if out.index.has_duplicates:
+        raise ValueError("行情含重复日期。")
+    out = out.sort_index().apply(pd.to_numeric, errors="raise")
+    if np.isinf(out.to_numpy(dtype=float)).any():
+        raise ValueError("行情包含无穷数值。")
+    out.index.name = "Date"
+    return out
 
-    qqq = df['QQQ']
-    bubble = df['总泡沫指数']
+
+def backup_bytes(raw):
+    """Portable, non-executable archive / 可移植的 CSV+JSON 备份。"""
+    raw = normalize_raw(raw)
+    csv = raw.to_csv(date_format="%Y-%m-%d").encode("utf-8")
+    meta = {
+        "schema": 1, "model": MODEL_VERSION, "auto_adjust": True,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "Yahoo Finance / yfinance", "config": USER_CONFIG,
+        "sha256": hashlib.sha256(csv).hexdigest(),
+    }
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("raw.csv", csv)
+        z.writestr("metadata.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    return buf.getvalue()
+
+
+def read_backup(content):
+    # Read in memory; never extract paths or deserialize executable pickle.
+    with zipfile.ZipFile(BytesIO(content)) as z:
+        if set(z.namelist()) != {"raw.csv", "metadata.json"}:
+            raise ValueError("备份必须包含 raw.csv 和 metadata.json。")
+        if any(i.file_size > 80_000_000 for i in z.infolist()):
+            raise ValueError("备份文件过大。")
+        meta = json.loads(z.read("metadata.json"))
+        csv = z.read("raw.csv")
+    if meta.get("schema") != 1 or meta.get("auto_adjust") is not True:
+        raise ValueError("备份版本或复权口径不匹配。")
+    if hashlib.sha256(csv).hexdigest() != meta.get("sha256"):
+        raise ValueError("备份校验失败。")
+    raw = pd.read_csv(BytesIO(csv), header=[0, 1], index_col=0, parse_dates=True)
+    return normalize_raw(raw), meta
+
+
+def save_snapshot(raw):
+    """Immutable snapshots: previous successful downloads are never overwritten.
+    独立保存每份变更后的行情快照，避免分红复权的新旧价格拼接。
+    """
+    payload = backup_bytes(raw)
+    digest = hashlib.sha256(raw.to_csv().encode()).hexdigest()[:16]
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"market_{raw.index[-1]:%Y%m%d}_{digest}.zip"
+    target = BACKUP_DIR / name
+    if not target.exists():
+        # Exclusive creation prevents accidental overwrite across app sessions.
+        import tempfile
+        with tempfile.NamedTemporaryFile(dir=BACKUP_DIR, suffix=".tmp", delete=False) as f:
+            temp = Path(f.name)
+            f.write(payload)
+        os.replace(temp, target)
+    return target
+
+
+def newest_backup():
+    if not BACKUP_DIR.exists():
+        return None
+    for path in sorted(BACKUP_DIR.glob("market_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            return read_backup(path.read_bytes())[0], path.name
+        except (ValueError, OSError, KeyError, zipfile.BadZipFile):
+            continue
+    return None
+
+
+@st.cache_data(ttl=USER_CONFIG["CACHE_SECONDS"], show_spinner=False)
+def fetch_market_data():
+    # Refresh a consistent adjusted-price snapshot, not an unsafe incremental splice.
+    raw = yf.download(TICKERS, start=USER_CONFIG["START_DATE"], interval="1d",
+                      auto_adjust=True, actions=True, progress=False, threads=True)
+    raw = normalize_raw(raw)
+    # The current incomplete US session is not an end-of-day observation.
+    us_today = pd.Timestamp.now(tz="America/New_York").date()
+    raw = raw.loc[raw.index.date < us_today]
+    raw = normalize_raw(raw)
+    # A truncated response must not silently replace a longer saved history.
+    saved = newest_backup()
+    if saved is not None:
+        old, _ = saved
+        for field, ticker in [("Close", t) for t in TICKERS] + [("Volume", "IPO")]:
+            old_valid = old[(field, ticker)].dropna()
+            new_valid = raw[(field, ticker)].dropna()
+            lost = old_valid.index.difference(new_valid.index)
+            if len(lost):
+                raise ValueError(f"本次响应缺少已保存的 {ticker}/{field} 历史记录（{len(lost)} 条）；"
+                                 "保留旧快照并回退，不拼接不同日期的复权价格。")
+    note = ""
+    if USER_CONFIG["SAVE_LOCAL_BACKUP"]:
+        try:
+            save_snapshot(raw)
+        except OSError as exc:
+            note = f"行情已取得，但服务器本地备份写入失败：{exc}。请下载备份。"
+    return raw, note
+
+
+def rolling_pct(series, window):
+    # Equivalent to the original rolling apply/rank, with full-window warmup.
+    return series.rolling(window, min_periods=window).rank(method="average", pct=True) * 100
+
+
+def available_weighted(factors, weights):
+    """Normalize only within each module; require at least one valid factor.
+    仅参考模型使用可用指标重分配；情绪和资金两个模块缺一不可。
+    """
+    sub = factors[weights.index]
+    denominator = sub.notna().mul(weights, axis=1).sum(axis=1)
+    numerator = sub.mul(weights, axis=1).sum(axis=1, min_count=1)
+    return numerator / denominator.where(denominator > 0)
+
+
+def calculate_indices(raw):
+    raw = normalize_raw(raw)
+    real_qqq = raw[("Close", "QQQ")].notna() & (raw[("Close", "QQQ")] > 0)
+    policy = USER_CONFIG["MISSING_POLICY"]
+    if policy not in {"legacy", "strict"}:
+        raise ValueError("MISSING_POLICY 必须是 legacy 或 strict。")
+    # Preserve the original alignment/fill semantics by default. Strict cleanup is
+    # an explicit model-data policy change, never a silent part of extending history.
+    calendar = raw.index if policy == "legacy" else raw.index[real_qqq]
+    observed = raw["Close"].reindex(index=calendar, columns=TICKERS).where(lambda x: x > 0)
+    observed_volume = raw[("Volume", "IPO")].reindex(calendar).where(lambda x: x >= 0)
+    close = observed.ffill() if policy == "legacy" else observed
+    volume = observed_volume.ffill() if policy == "legacy" else observed_volume
+    # Forward fill cannot create values before a ticker's first observation.
+    factors = pd.DataFrame(index=calendar)
+    sma200 = close["QQQ"].rolling(200, min_periods=200).mean()
+    factors["P1"] = rolling_pct((close["QQQ"] - sma200) / sma200, 2520)
+    factors["P2"] = rolling_pct(1 / close["^VIX"], 2520)
+    factors["P3"] = 50 + (rolling_pct(close["SPHB"] / close["SPLV"], 756) - 50) * .4
+    vmean = volume.rolling(126, min_periods=126).mean().replace(0, np.nan)
+    enhanced = (close["IPO"] / close["SPY"]) * (volume / vmean)
+    factors["P4"] = rolling_pct(enhanced, 756)
+    p5 = rolling_pct(close["HYG"] / close["IEF"], 756).rolling(10).mean()
+    factors["P5"] = (80 - (100 - p5) * 3.0).clip(0, 100)
+    change = (close["^TNX"] - close["^TNX"].shift(20)).rolling(10).mean()
+    factors["P6"] = pd.Series(np.select(
+        [change < -.25, change < -.05, change < .15], [100., 75., 50.], default=25.),
+        index=calendar).where(change.notna())
+    if policy == "legacy":
+        factors["P6"] = factors["P6"].ffill()
+    factors = factors.replace([np.inf, -np.inf], np.nan)
+
+    # Full model / 完整模型：原权重、压缩、两次平滑与 +15 均保留。
+    s_raw = (factors.P1 * .3 + factors.P2 * .3 + factors.P3 * .1 + factors.P4 * .3)
+    s_full = 20 + (s_raw.rolling(10).mean() - 20) * .83
+    c_full = (factors.P5 + factors.P6) / 2
+    full = (((s_full * 2 + c_full) / 3).rolling(10).mean()
+            + USER_CONFIG["BIAS_POINTS"]).clip(0, 100)
+
+    # Early reference / 早期参考：不缩短窗口、不补造历史。
+    s_ref = 20 + (available_weighted(factors, SENTIMENT_WEIGHTS).rolling(10).mean() - 20) * .83
+    c_ref = available_weighted(factors, CAPITAL_WEIGHTS)
+    reference = (((s_ref * 2 + c_ref) / 3).rolling(10).mean()
+                 + USER_CONFIG["BIAS_POINTS"]).clip(0, 100)
+    first_full = full.first_valid_index()
+    # Never reclassify later outages as early history.
+    if first_full is not None:
+        reference = reference.where(reference.index < first_full)
+    display = full.combine_first(reference)
+    df = factors.copy()
+    df["完整指数"] = full
+    df["早期参考指数"] = reference
+    df["总泡沫指数"] = display
+    df["数据类型"] = np.select([full.notna(), reference.notna()], ["完整模型", "早期参考"], default="不可计算")
+    df["综合情绪指标"] = s_full.where(full.notna(), s_ref.where(reference.notna()))
+    df["综合资金指标"] = c_full.where(full.notna(), c_ref.where(reference.notna()))
+    df["QQQ"] = close["QQQ"]
+    df["QQQ_1w_ret"] = close["QQQ"].pct_change(5, fill_method=None)
+    df["有效指标数"] = factors.notna().sum(axis=1)
+    weights = pd.Series({"P1": .2, "P2": .2, "P3": 1/15, "P4": .2, "P5": 1/6, "P6": 1/6})
+    df["原权重覆盖率"] = factors.notna().mul(weights).sum(axis=1) * 100
+    df["平滑期最低覆盖率"] = df["原权重覆盖率"].rolling(19).min()
+    df["参与指标"] = factors.notna().apply(lambda row: ", ".join(row.index[row]), axis=1)
+    filled = (observed.isna() & close.notna()).any(axis=1) | (observed_volume.isna() & volume.notna())
+    df["当日沿用旧行情"] = filled
+    df["近19日含补值"] = filled.astype(int).rolling(19, min_periods=1).max().astype(bool)
+    df.index.name = "日期"
+    # Display and return horizons use actual QQQ dates, while original factor
+    # calculation calendar is retained in legacy mode for numerical compatibility.
+    return df.loc[df.index.intersection(raw.index[real_qqq])]
+
+
+def percentile_summary(df):
+    """Always use full history through the same latest complete date; never view filters."""
+    full = df["完整指数"].dropna()
+    if full.empty:
+        return None
+    asof = full.index[-1]
+    global_values = df.loc[:asof, "总泡沫指数"].dropna()
+    val = float(full.iloc[-1])
+    return {"asof": asof, "value": val, "full": full, "global": global_values,
+            "full_pct": float(percentileofscore(full, val, kind="rank")),
+            "global_pct": float(percentileofscore(global_values, val, kind="rank"))}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_backtest(df):
+    """Complete-model signal dates only; future returns use the unfiltered QQQ calendar.
+    收益周期按真实交易日偏移，不能先删去缺失信号日再计算持有周期。
+    """
     results = []
-
     for lo, hi, label, color in ZONES:
-        mask = (bubble >= lo) & (bubble < hi)
-        dates = df.index[mask]
-        row = {'区间': label, '信号天数': int(mask.sum()), 'color': color}
-
-        for period_name, days in PERIODS:
-            rets = []
-            for d in dates:
-                try:
-                    loc = qqq.index.get_loc(d)
-                    if loc + days < len(qqq):
-                        r = (qqq.iloc[loc + days] / qqq.iloc[loc] - 1) * 100
-                        rets.append(r)
-                except Exception:
-                    pass
-
-            if rets:
-                row[f'{period_name}_avg']    = round(float(np.mean(rets)), 2)
-                row[f'{period_name}_median'] = round(float(np.median(rets)), 2)
-                row[f'{period_name}_win']    = round(sum(r > 0 for r in rets) / len(rets) * 100, 1)
-                row[f'{period_name}_n']      = len(rets)
-            else:
-                row[f'{period_name}_avg']    = np.nan
-                row[f'{period_name}_median'] = np.nan
-                row[f'{period_name}_win']    = np.nan
-                row[f'{period_name}_n']      = 0
-
+        mask = df["完整指数"].ge(lo) & df["完整指数"].lt(hi)
+        row = {"区间": label, "信号天数": int(mask.sum()), "color": color}
+        for name, days in PERIODS:
+            rets = ((df.QQQ.shift(-days) / df.QQQ - 1) * 100).loc[mask].dropna()
+            row.update({f"{name}_avg": rets.mean(), f"{name}_median": rets.median(),
+                        f"{name}_win": (rets > 0).mean() * 100 if len(rets) else np.nan,
+                        f"{name}_n": len(rets)})
         results.append(row)
     return results
 
-# ============================================================
-# 新增模块：华夏基金 OLS 预测逻辑
-# ============================================================
+
+def index_color(value, ret=0):
+    if pd.isna(value): return C_MUTED
+    # Same [lo, hi) boundary rule as the backtest.
+    for lo, hi, _, color in ZONES:
+        if lo <= value < hi:
+            return "#FF9F0A" if lo == 45 and ret >= 0 else color
+    return C_MUTED
+
+
+def period_text(values):
+    values = values.dropna()
+    return "暂无有效数据" if values.empty else f"{values.index[0]:%Y-%m-%d} — {values.index[-1]:%Y-%m-%d} · {len(values):,} 个交易日"
+
+
+def plot_index(frame):
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    for lo, hi, _, color in ZONES:
+        fig.add_hrect(y0=lo, y1=min(hi, 100), fillcolor=color, opacity=.045,
+                      line_width=0, layer="below", secondary_y=False)
+    fig.add_trace(go.Scatter(x=frame.index, y=frame.QQQ, name="QQQ",
+        line=dict(color="rgba(209,212,220,.25)", width=1.2),
+        hovertemplate="QQQ: $%{y:.2f}<extra></extra>"), secondary_y=True)
+    # Mask traces without dropping rows so unavailable periods are never connected.
+    colors = pd.Series([index_color(v,r) for v,r in zip(frame["完整指数"], frame.QQQ_1w_ret)], index=frame.index)
+    # Connected segments share their boundary point; null values explicitly break lines.
+    for color in colors.unique():
+        mask = colors.eq(color) & frame["完整指数"].notna()
+        y = frame["完整指数"].where(mask | mask.shift(1, fill_value=False))
+        fig.add_trace(go.Scatter(x=frame.index, y=y, mode="lines", connectgaps=False,
+            line=dict(color=color, width=2.6), hoverinfo="skip", showlegend=False), secondary_y=False)
+    fig.add_trace(go.Scatter(x=frame.index, y=frame["完整指数"], mode="lines", name="完整模型",
+        line=dict(color="rgba(0,0,0,0)", width=.1), connectgaps=False,
+        hovertemplate="完整指数: %{y:.2f}<extra></extra>"), secondary_y=False)
+    fig.add_trace(go.Scatter(x=frame.index, y=frame["早期参考指数"], mode="lines", name="早期参考（非完整模型）",
+        line=dict(color="#a4a8b5", width=2, dash="dash"), connectgaps=False,
+        customdata=frame[["有效指标数", "原权重覆盖率", "参与指标"]].to_numpy(),
+        hovertemplate="早期参考: %{y:.2f}<br>当日有效: %{customdata[0]}/6"
+                      "<br>原权重覆盖: %{customdata[1]:.1f}%<br>%{customdata[2]}<extra></extra>"), secondary_y=False)
+    layout = dark_layout(height=530)
+    layout.update(showlegend=True, legend=dict(orientation="h", y=1.12, x=0))
+    fig.update_layout(**layout)
+    fig.update_yaxes(range=[0,100], title_text="泡沫指数 / 早期参考", secondary_y=False)
+    fig.update_yaxes(title_text="QQQ 复权价格", showgrid=False, secondary_y=True)
+    return fig
+
+
+def render_main():
+    st.markdown("# 🛡️ 私人量化终端：AI 泡沫综合指数 V3.1")
+    st.sidebar.header("⚙️ 看板控制台")
+    upload = st.sidebar.file_uploader("从历史备份读取（ZIP）", type=["zip"])
+    if st.sidebar.button("重新获取行情"):
+        fetch_market_data.clear()
+    try:
+        if upload is not None:
+            raw, meta = read_backup(upload.getvalue())
+            st.info(f"当前使用上传备份，创建时间：{meta.get('created_utc', '未知')}。移除文件后恢复在线行情。")
+        else:
+            try:
+                with st.spinner("正在获取完整历史行情…"):
+                    raw, note = fetch_market_data()
+                if note: st.warning(note)
+            except Exception as exc:
+                saved = newest_backup()
+                if saved is None:
+                    raise RuntimeError(f"行情获取失败，且没有可用本地备份：{exc}") from exc
+                raw, name = saved
+                st.warning(f"在线获取失败，正在使用本地备份 {name}。原因：{exc}")
+        df = calculate_indices(raw)
+    except Exception as exc:
+        st.error(str(exc))
+        st.info("可在侧边栏上传以前下载的 ZIP 行情备份。")
+        st.stop()
+
+    stats = percentile_summary(df)
+    valid = df[df["总泡沫指数"].notna()]
+    if valid.empty:
+        st.error("历史长度尚不足以计算任何指数。")
+        st.stop()
+    full_df = df[df["完整指数"].notna()]
+    ref_df = df[df["早期参考指数"].notna()]
+    show_early = st.sidebar.checkbox("显示早期参考历史", value=False)
+    span = st.sidebar.selectbox("时间轴范围", ["最近 400 个交易日", "最近 1000 个交易日", "全部可用历史"])
+    start = valid.index[0] if show_early or full_df.empty else full_df.index[0]
+    frame = df.loc[start:].copy()
+    if span != "全部可用历史":
+        frame = frame.tail(400 if "400" in span else 1000)
+    if not show_early:
+        frame["早期参考指数"] = np.nan
+    st.sidebar.caption("时间范围只控制图表；两种百分位始终使用各自全部历史。")
+
+    if stats:
+        asof, val = stats["asof"], stats["value"]
+        full = stats["full"]
+        delta = float(full.iloc[-1] - full.iloc[-2]) if len(full) > 1 else None
+        c1,c2,c3 = st.columns([1,2,1])
+        c1.metric("完整模型 · AI 泡沫指数", f"{val:.1f}", f"{delta:+.2f}" if delta is not None else None, delta_color="inverse")
+        label = next(label for lo,hi,label,_ in ZONES if lo <= val < hi)
+        c2.metric("市场状态评级", label)
+        c3.metric("完整指数截止日期", f"{asof:%Y-%m-%d}")
+        left,right = st.columns(2)
+        left.metric("完整期百分位 · 主要", f"{stats['full_pct']:.1f}%")
+        left.caption(period_text(stats["full"]))
+        right.metric("全局参考百分位 · 辅助", f"{stats['global_pct']:.1f}%")
+        right.caption(period_text(stats["global"]) + "；含早期不完整模型")
+        if asof < df.index[-1]:
+            st.warning(f"最新行情至 {df.index[-1]:%Y-%m-%d}，但完整指数仅有效至 {asof:%Y-%m-%d}。"
+                       "后续缺失不转为早期参考；两个百分位统一截止于该有效日期。")
+    else:
+        st.warning("尚无完整指数；仅能探索参考曲线，不显示完整期或全局百分位，也不开展正式回测。")
+    st.caption("完整期要求六项指标及其平滑窗口齐全。早期参考仅在模块内部重分配可用指标权重，"
+               "仍保留情绪∶资金=2∶1、原始窗口与 +15 修正。全局百分位混合了不同指标组合，仅供辅助。")
+    if USER_CONFIG["MISSING_POLICY"] == "legacy":
+        st.caption("当前保持旧版行情处理：上市后的缺口沿用前值，上市前不补值。"
+                   "“完整期”指六项指标均可按旧版规则计算，不等于原始行情完全无缺口。")
+        if stats and bool(df.loc[stats["asof"], "近19日含补值"]):
+            st.warning("近期行情存在缺口，当前指数按旧版规则沿用前值计算；数据页可查看逐日补值标记。")
+
+    tabs = st.tabs(["📈 综合指数看板", "🔬 历史回测分析", "🔮 华夏净值预测 (OLS)", "🗂️ 数据与备份"])
+    with tabs[0]:
+        st.subheader("综合指数走势")
+        st.plotly_chart(plot_index(frame), width="stretch")
+        if not show_early and len(ref_df):
+            st.caption("查看更早曲线：勾选侧边栏“显示早期参考历史”，并选择“全部可用历史”。")
+        if stats:
+            st.subheader("历史分布：完整期与早期参考分开显示")
+            hist = go.Figure()
+            hist.add_trace(go.Histogram(x=stats["full"], name="完整模型", xbins=dict(start=0,end=100,size=2), marker_color=C_BLUE, opacity=.75))
+            early_values = df.loc[:stats["asof"], "早期参考指数"].dropna()
+            hist.add_trace(go.Histogram(x=early_values, name="早期参考", xbins=dict(start=0,end=100,size=2), marker_color="#a4a8b5", opacity=.5))
+            hist.add_vline(x=stats["value"], line_color="#F7DC6F", annotation_text=f"当前完整指数 {stats['value']:.1f}")
+            hist.update_layout(**dark_layout(height=320, y_title="交易日数"))
+            hist.update_layout(barmode="overlay", showlegend=True)
+            hist.update_xaxes(range=[0,100], title="指数值")
+            st.plotly_chart(hist, width="stretch")
+        cols = st.columns(2)
+        for col,field,color in zip(cols,["综合情绪指标","综合资金指标"],[C_BLUE,"#FF9F0A"]):
+            with col:
+                st.markdown(f"**{field}**")
+                fig = go.Figure()
+                for kind,dash in [("完整模型","solid"),("早期参考","dash")]:
+                    if kind == "早期参考" and not show_early: continue
+                    fig.add_trace(go.Scatter(x=frame.index, y=frame[field].where(frame["数据类型"].eq(kind)),
+                        name=kind, line=dict(color=color if kind=="完整模型" else C_MUTED,dash=dash),connectgaps=False))
+                fig.update_layout(**dark_layout(height=250))
+                st.plotly_chart(fig, width="stretch")
+    with tabs[1]:
+        render_backtest(df)
+    with tabs[2]:
+        render_ols()
+    with tabs[3]:
+        st.subheader("历史覆盖与参与指标")
+        st.write("完整指数：" + period_text(df["完整指数"]))
+        st.write("早期参考：" + period_text(df["早期参考指数"]))
+        coverage = []
+        for t in TICKERS:
+            series = raw[("Close",t)].dropna()
+            coverage.append({"标的": t, "最早行情": str(series.index[0].date()),
+                             "最新行情": str(series.index[-1].date()), "有效日线数":len(series)})
+        st.dataframe(pd.DataFrame(coverage), hide_index=True, width="stretch")
+        st.dataframe(pd.DataFrame([{"指标":k,"含义":v,"首次有效日期":str(df[k].first_valid_index())[:10]}
+                                  for k,v in FACTOR_NAMES.items()]), hide_index=True)
+        st.caption("覆盖率是当前有效指标的原始权重占比，不是准确率。"
+                   "因连续两次平滑，首次六项齐全后还需预热才能进入完整期。"
+                   "图表和持有周期以 QQQ 有效交易日为准。")
+        st.caption(f"行情处理策略：{USER_CONFIG['MISSING_POLICY']}。legacy 保留原版补值与指标日历；"
+                   "strict 不补缺失价格或成交量。切换到 strict 属于数据处理口径变更，会改变部分读数。")
+        with st.expander("逐日核对指标与模型类型"):
+            st.dataframe(df.tail(500), width="stretch")
+            st.caption("页面列出最近 500 个交易日；CSV 包含全部日期及 P1–P6。")
+        st.download_button("下载完整指数与参考历史 CSV", df.to_csv().encode("utf-8-sig"),
+                           "bubble_history_v31.csv", "text/csv")
+        st.download_button("下载原始行情备份 ZIP（可恢复）", backup_bytes(raw),
+                           f"bubble_market_{raw.index[-1]:%Y%m%d}.zip", "application/zip")
+        st.info("默认在运行服务器的 bubble_data 目录保存独立行情快照。Streamlit Community Cloud "
+                "不保证本地文件永久保留，请下载 ZIP 到自己的电脑；可在侧边栏上传恢复。"
+                "本版本尚未连接外部云存储，也不会在 App 关闭后定时下载。")
+        st.caption("每次更新保存整份一致的复权行情，避免新旧复权价格直接拼接。"
+                   "旧快照不会被新的下载覆盖；未缩短任何计算窗口。")
+
+
+def render_backtest(df):
+    st.subheader("历史回测：仅使用完整模型的信号")
+    full = df["完整指数"].dropna()
+    if full.empty:
+        st.info("暂无完整模型历史，不能开展正式回测。")
+        return
+    st.caption(period_text(full) + "。早期参考段不参与；逐日信号存在重叠，样本并非独立交易。")
+    results = run_backtest(df)
+    rows=[]
+    for r in results:
+        row={"区间":r["区间"], "信号天数":r["信号天数"]}
+        for p,_ in PERIODS:
+            row[f"{p}均收益(%)"] = r[f"{p}_avg"]
+            row[f"{p}胜率(%)"] = r[f"{p}_win"]
+            row[f"{p}有效样本"] = r[f"{p}_n"]
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows).round(2), hide_index=True, width="stretch")
+    period=st.selectbox("持有周期",[p for p,_ in PERIODS],index=2)
+    fig=go.Figure()
+    fig.add_trace(go.Bar(x=[r["区间"] for r in results],y=[r[f"{period}_avg"] for r in results],name="均值",marker_color=C_BLUE))
+    fig.add_trace(go.Scatter(x=[r["区间"] for r in results],y=[r[f"{period}_median"] for r in results],name="中位数",mode="markers",marker=dict(color="#F7DC6F",size=12,symbol="diamond")))
+    fig.update_layout(**dark_layout(height=400,y_title="收益率 (%)"))
+    fig.update_layout(showlegend=True)
+    st.plotly_chart(fig,width="stretch")
+    win=go.Figure(go.Bar(x=[r["区间"] for r in results],y=[r[f"{period}_win"] for r in results],marker_color=C_BLUE))
+    win.add_hline(y=50,line_dash="dash",line_color="#FF9F0A")
+    win.update_layout(**dark_layout(height=320,y_range=[0,100],y_title="正收益胜率 (%)"))
+    st.plotly_chart(win,width="stretch")
+    multi=go.Figure()
+    for p,_ in PERIODS:
+        multi.add_trace(go.Scatter(x=[r["区间"] for r in results],y=[r[f"{p}_avg"] for r in results],name=p,mode="lines+markers"))
+    multi.update_layout(**dark_layout(height=360,y_title="平均收益率 (%)"))
+    multi.update_layout(showlegend=True)
+    st.plotly_chart(multi,width="stretch")
+    st.caption("采用当日收盘指数与收盘价的条件收益统计，未模拟可执行成交、成本或资金管理；历史收益不代表未来表现。")
+
+
 @st.cache_data(ttl=3600)
 def fetch_ols_data():
     try:
@@ -279,8 +506,8 @@ def fetch_ols_data():
         start_date = pd.Timestamp(f'{current_year}-04-29')
         
         us_data = yf.download(['^NDX', '^SOX'], start=start_date, end=end_date)['Close']
-        us_pct = us_data.pct_change().dropna() * 100
-        us_pct.columns = ['NDX', 'SOX']
+        us_pct = us_data.pct_change(fill_method=None).dropna() * 100
+        us_pct = us_pct.rename(columns={'^NDX': 'NDX', '^SOX': 'SOX'})
         if us_pct.index.tz is not None: us_pct.index = us_pct.index.tz_localize(None)
 
         # 2. 抓取天天基金网数据
@@ -341,7 +568,7 @@ def get_latest_market_returns():
     try:
         # 抓取最近 5 天数据以确保至少有两个有效交易日来计算涨跌幅
         df_recent = yf.download(['^NDX', '^SOX'], period='5d')['Close']
-        pct_recent = df_recent.pct_change().dropna() * 100
+        pct_recent = df_recent.pct_change(fill_method=None).dropna() * 100
         dt_str = pct_recent.index[-1].strftime('%Y-%m-%d')
         val_ndx = float(pct_recent['^NDX'].iloc[-1])
         val_sox = float(pct_recent['^SOX'].iloc[-1])
@@ -349,407 +576,19 @@ def get_latest_market_returns():
     except Exception:
         return "未知日期", 0.0, 0.0
 
-# ============================================================
-# 页面渲染
-# ============================================================
-st.markdown(
-    "<h1>🛡️ 私人量化终端：美投 AI 泡沫综合指数 V3.0 <span style='float: right; font-size: 0.9rem; color: #787b86; padding-top: 15px; font-weight: normal; font-family: \"Courier New\", monospace;'>Built by <b style='color: #2962ff;'>高章磊</b></span></h1>", 
-    unsafe_allow_html=True
-)
-
-with st.spinner("📡 正在从华尔街同步底层数据..."):
-    df = fetch_and_calculate()
-
-if df.empty:
-    st.cache_data.clear()
-    st.warning("⚠️ 云端网络拥堵或雅虎财经 API 临时限流，未获取到完整数据。缓存已自动清理，请几秒钟后刷新网页重试。")
-    st.stop()
-
-# 侧边栏
-st.sidebar.header("⚙️ 看板控制台")
-days = st.sidebar.slider("时间轴范围 (天)", 100, 1500, 400)
-plot_df = df.tail(days).copy()
-
-# ============================================================
-# 计算动态线段颜色
-# ============================================================
-line_colors = []
-for i in range(len(plot_df)):
-    v = plot_df['总泡沫指数'].iloc[i]
-    r = plot_df['QQQ_1w_ret'].iloc[i]
-    
-    if v > 75:     c = "#F7DC6F" # 淡黄 (风险)
-    elif v > 60:   c = "#2962ff" # 蓝 (合理)
-    elif v > 52:   c = "#FF9F0A" # 橙 (背离警告)
-    elif v > 45:   c = "#FF3B30" if r < 0 else "#FF9F0A" # 红 (跌破52且下降=破位) or 橙
-    elif v > 41.5: c = "#FFD700" # 黄 (恐慌底部)
-    elif v > 39:   c = "#90EE90" # 淡绿 (定投机会)
-    elif v > 33:   c = "#32CD32" # 纯绿 (分批买入)
-    else:          c = "#00FFFF" # 青色 (极限大底)
-    
-    line_colors.append(c)
-
-plot_df['Line_Color'] = line_colors
-
-# 当前状态 (结合全新变色警戒法则)
-val   = float(plot_df['总泡沫指数'].iloc[-1])
-ret_1w = float(plot_df['QQQ_1w_ret'].iloc[-1])
-delta = val - float(plot_df['总泡沫指数'].iloc[-2]) if len(plot_df) > 1 else 0.0
-
-if   val > 75:   status, emoji = "估值偏高 (提示风险/谨慎)", "🚨"
-elif val > 60:   status, emoji = "合理价位 (正常持有状态)", "🔵"
-elif val > 52:   status, emoji = "高位背离 (警惕动量衰竭)", "⚠️"
-elif val > 45: 
-    if ret_1w < 0: status, emoji = "趋势变坏 (市场开始下跌)", "📉"
-    else:          status, emoji = "跌破防线 (趋势转弱观望)", "📉"
-elif val > 41.5: status, emoji = "恐慌发酵 (底部酝酿中)", "🟡"
-elif val > 39:   status, emoji = "定投机会 (大资金开启定投)", "🟢"
-elif val > 33:   status, emoji = "大底区间 (大额分批买入)", "🟩"
-else:            status, emoji = "极限大底 (降低现金重仓进入)", "💎"
-
-# 历史百分位（基于全量历史，不受滑块影响）
-all_vals = df['总泡沫指数'].dropna().values
-pct_rank = percentileofscore(all_vals, val, kind='rank')
-history_start = df.index[0].strftime('%Y-%m')
-
-# 百分位对应提示
-if pct_rank >= 90:   pct_note = "历史极高位 ⚠️"
-elif pct_rank >= 75: pct_note = "历史偏高"
-elif pct_rank >= 25: pct_note = "历史中性"
-elif pct_rank >= 10: pct_note = "历史偏低"
-else:                pct_note = "历史极低位 💎"
-
-# 顶部指标卡（4列）
-col1, col2, col3, col4 = st.columns([1, 2, 1, 1])
-col1.metric("🚨 AI 泡沫指数",  f"{val:.1f}", f"{delta:+.2f}", delta_color="inverse")
-col2.metric("📊 市场状态评级", f"{emoji} {status}")
-col3.metric("📅 最新更新日期", plot_df.index[-1].strftime('%Y-%m-%d'))
-col4.metric(f"📐 历史百分位 (since {history_start})", f"{pct_rank:.1f}%", pct_note)
-
-st.markdown("---")
-
-# ============================================================
-# Tabs
-# ============================================================
-tab1, tab2, tab3 = st.tabs(["  📈  综合指数看板  ", "  🔬  历史回测分析  ", "  🔮  华夏净值预测 (OLS)  "])
-
-# ──────────────────────────────────────────────
-# Tab 1：综合指数看板
-# ──────────────────────────────────────────────
-with tab1:
-    st.subheader("🌐 综合指数走势 (战术网格全景)")
-
-    # 引入双Y轴
-    fig_main = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # 背景色块 (完美对齐新区间，约束宽度避免溢出)
-    for y0, y1, fc, op in [
-        (75, 100,  "#F7DC6F", 0.05), # 淡黄
-        (60, 75,   "#2962ff", 0.03), # 蓝
-        (52, 60,   "#FF9F0A", 0.04), # 橙
-        (45, 52,   "#FF3B30", 0.05), # 红
-        (41.5, 45, "#FFD700", 0.06), # 黄
-        (39, 41.5, "#90EE90", 0.08), # 淡绿
-        (33, 39,   "#32CD32", 0.10), # 纯绿
-        (0,  33,   "#00FFFF", 0.12), # 青色
-    ]:
-        fig_main.add_shape(
-            type="rect",
-            xref="x domain", x0=0, x1=1,
-            yref="y", y0=y0, y1=y1,
-            fillcolor=fc, opacity=op, layer="below", line_width=0
-        )
-
-    # 水位网格线 (更新为全新的战术分界线)
-    for y, label, color, dash in [
-        (75, "风险警惕线 (75)",   "#F7DC6F", "solid"),
-        (60, "合理估值上限 (60)", "#2962ff", "dash"),
-        (52, "趋势破位线 (52)",   "#FF9F0A", "dot"),
-        (45, "恐慌底部分界 (45)", "#FFD700", "dash"),
-        (41.5, "优质定投线 (41.5)", "#90EE90", "dot"),
-        (39, "大额买入线 (39)",   "#32CD32", "dash"),
-        (33, "极限重仓线 (33)",   "#00FFFF", "solid"),
-    ]:
-        pos = "top left" if y >= 52 else "bottom left"
-        fig_main.add_hline(
-            y=y, line_dash=dash, line_color=color, line_width=1.5 if y in [60, 45] else 1.2,
-            annotation_text=label, annotation_position=pos,
-            annotation_font_color=color, annotation_font_size=13,
-            secondary_y=False
-        )
-
-    # 纳指100 (QQQ) 作为背景山脉图 (次坐标轴)
-    fig_main.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_df['QQQ'],
-        mode='lines', name='纳指100 (QQQ)',
-        line=dict(color='rgba(209, 212, 220, 0.25)', width=1.5), 
-        fill='tozeroy', fillcolor='rgba(209, 212, 220, 0.05)',   
-        hovertemplate='纳指QQQ: $%{y:.2f}<extra></extra>',
-    ), secondary_y=True)
-
-    # 分段绘制主曲线（实现动态变色）
-    current_color = plot_df['Line_Color'].iloc[0]
-    segment_x = [plot_df.index[0]]
-    segment_y = [plot_df['总泡沫指数'].iloc[0]]
-
-    for i in range(1, len(plot_df)):
-        x = plot_df.index[i]
-        y = plot_df['总泡沫指数'].iloc[i]
-        c = plot_df['Line_Color'].iloc[i]
-        
-        segment_x.append(x)
-        segment_y.append(y)
-        
-        if c != current_color or i == len(plot_df) - 1:
-            fig_main.add_trace(go.Scatter(
-                x=segment_x, y=segment_y,
-                mode='lines',
-                line=dict(color=current_color, width=3.0), # 稍微加粗，增强色彩视觉
-                showlegend=False,
-                hoverinfo='skip' # 禁用分段的悬停，使用下方隐形统一线
-            ), secondary_y=False)
-            
-            current_color = c
-            segment_x = [x]
-            segment_y = [y]
-
-    # 添加一层全透明的完整隐形线，专门用于触发完美的悬停(Hover)效果
-    fig_main.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_df['总泡沫指数'],
-        mode='lines', name='泡沫指数',
-        line=dict(color='rgba(0,0,0,0)', width=0.1),
-        hovertemplate='日期: %{x|%Y-%m-%d}<br>泡沫指数: %{y:.2f}<extra></extra>',
-    ), secondary_y=False)
-
-    # 更新布局
-    layout = dark_layout(height=530)
-    fig_main.update_layout(**layout)
-    
-    # 独立设置双Y轴的范围和网格显示，防止次坐标轴的网格线干扰画面
-    fig_main.update_yaxes(title_text="泡沫指数 (0-100)", range=[0, 100], secondary_y=False, title_font=dict(size=15), tickfont=dict(size=14))
-    fig_main.update_yaxes(title_text="纳指 QQQ 价格", showgrid=False, secondary_y=True, tickfont=dict(color='rgba(209, 212, 220, 0.5)', size=14), title_font=dict(size=15))
-
-    st.plotly_chart(fig_main, use_container_width=True)
-
-    # 历史分布图
-    st.markdown("---")
-    st.subheader("📐 历史百分位分布")
-
-    hist_vals = df['总泡沫指数'].dropna().values
-
-    fig_dist = go.Figure()
-
-    # 背景色块（和主图一致同步更新）
-    for y0, y1, fc, op in [
-        (75, 100,  "#F7DC6F", 0.05),
-        (60, 75,   "#2962ff", 0.03),
-        (52, 60,   "#FF9F0A", 0.04),
-        (45, 52,   "#FF3B30", 0.05), 
-        (41.5, 45, "#FFD700", 0.06),
-        (39, 41.5, "#90EE90", 0.08),
-        (33, 39,   "#32CD32", 0.10),
-        (0,  33,   "#00FFFF", 0.12),
-    ]:
-        fig_dist.add_vrect(x0=y0, x1=y1, line_width=0, fillcolor=fc, opacity=op)
-
-    # 历史分布直方图
-    fig_dist.add_trace(go.Histogram(
-        x=hist_vals, nbinsx=50,
-        name='历史分布',
-        marker_color='rgba(41,98,255,0.5)',
-        marker_line=dict(color='rgba(41,98,255,0.8)', width=0.5),
-        hovertemplate='区间: %{x:.1f}<br>天数: %{y}<extra></extra>',
-    ))
-
-    # 当前值竖线
-    fig_dist.add_vline(
-        x=val, line_dash="solid", line_color="#F7DC6F", line_width=2.5,
-        annotation_text=f"当前 {val:.1f}  ({pct_rank:.1f}% 百分位)",
-        annotation_position="top right",
-        annotation_font_color="#F7DC6F",
-        annotation_font_size=15,
-    )
-
-    layout_dist = dark_layout(height=300, y_title="出现天数")
-    layout_dist['xaxis']['title'] = dict(text="泡沫指数值", font=dict(color=C_MUTED, size=15))
-    layout_dist['xaxis']['range'] = [0, 100]
-    layout_dist['hovermode'] = "x"
-    fig_dist.update_layout(**layout_dist)
-    st.plotly_chart(fig_dist, use_container_width=True)
-
-    st.markdown(
-        f"<p style='color:#787b86;font-size:0.95rem;'>"
-        f"基于 {history_start} 至今共 <b style='color:#d1d4dc'>{len(hist_vals)}</b> 个交易日的历史数据。"
-        f"当前读数 <b style='color:#F7DC6F'>{val:.1f}</b> 高于历史上 "
-        f"<b style='color:#F7DC6F'>{pct_rank:.1f}%</b> 的交易日。</p>",
-        unsafe_allow_html=True,
-    )
-    col_A, col_B = st.columns(2)
-
-    with col_A:
-        st.markdown("**🧠 综合情绪指标 (占比 66.7%)**")
-        fig_s = go.Figure()
-        fig_s.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['综合情绪指标'],
-            mode='lines', line=dict(color=C_BLUE, width=2),
-            fill='tozeroy', fillcolor='rgba(41,98,255,0.08)',
-            hovertemplate='日期: %{x|%Y-%m-%d}<br>情绪: %{y:.2f}<extra></extra>',
-        ))
-        fig_s.update_layout(**dark_layout(height=260))
-        st.plotly_chart(fig_s, use_container_width=True)
-
-    with col_B:
-        st.markdown("**💰 综合资金指标 (占比 33.3%)**")
-        fig_c = go.Figure()
-        fig_c.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['综合资金指标'],
-            mode='lines', line=dict(color='#FF9F0A', width=2),
-            fill='tozeroy', fillcolor='rgba(255,159,10,0.08)',
-            hovertemplate='日期: %{x|%Y-%m-%d}<br>资金: %{y:.2f}<extra></extra>',
-        ))
-        fig_c.update_layout(**dark_layout(height=260))
-        st.plotly_chart(fig_c, use_container_width=True)
 
 
-# ──────────────────────────────────────────────
-# Tab 2：历史回测分析
-# ──────────────────────────────────────────────
-with tab2:
-    st.subheader("🔬 历史回测：各泡沫区间买入 QQQ 的历史表现")
-    st.markdown(
-        "<p style='color:#787b86;font-size:0.95rem;'>"
-        "统计自 2012 年以来，当泡沫指数处于各区间时买入 QQQ，持有不同周期后的收益情况。"
-        "仅供参考，不构成投资建议。</p>",
-        unsafe_allow_html=True,
-    )
-
-    with st.spinner("⚙️ 正在运行历史回测..."):
-        results = run_backtest(df.to_json())
-
-    # ── 汇总表格 ──
-    st.markdown("#### 📋 各区间历史收益汇总表")
-    table_rows = []
-    for r in results:
-        row = {'泡沫区间': r['区间'], '历史信号天数': r['信号天数']}
-        for p, _ in PERIODS:
-            avg = r.get(f'{p}_avg', np.nan)
-            win = r.get(f'{p}_win', np.nan)
-            row[f'{p} 均收益'] = f"{avg:+.1f}%" if not np.isnan(avg) else "N/A"
-            row[f'{p} 胜率']   = f"{win:.0f}%"  if not np.isnan(win) else "N/A"
-        table_rows.append(row)
-
-    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    # ── 选择持有周期 ──
-    selected = st.selectbox("📅 选择持有周期查看详细图表", [p[0] for p in PERIODS], index=2)
-
-    avgs   = [r.get(f'{selected}_avg',     np.nan) for r in results]
-    meds   = [r.get(f'{selected}_median', np.nan) for r in results]
-    wins   = [r.get(f'{selected}_win',     np.nan) for r in results]
-    labels = [r['区间'] for r in results]
-
-    # ── 均值 vs 中位数收益 ──
-    st.markdown(f"#### 📊 持有 {selected} 的平均 & 中位数收益率 (QQQ)")
-    fig_bt = go.Figure()
-
-    fig_bt.add_trace(go.Bar(
-        name='平均收益', x=labels, y=avgs,
-        marker_color=['rgba(52,199,89,0.85)' if (v or 0) >= 0 else 'rgba(255,59,48,0.85)' for v in avgs],
-        # 标签放柱子内部，避免和菱形重叠
-        text=[f"{v:+.1f}%" if not np.isnan(v) else "" for v in avgs],
-        textposition='inside',
-        textfont=dict(color='white', size=13, family='Courier New, monospace'),
-        insidetextanchor='middle',
-        hovertemplate='%{x}<br>平均收益: %{y:+.1f}%<extra></extra>',
-    ))
-    fig_bt.add_trace(go.Scatter(
-        name='中位数收益', x=labels, y=meds,
-        mode='markers',  # 去掉 text mode，数值仅在 hover 显示
-        marker=dict(color='#F7DC6F', size=12, symbol='diamond',
-                    line=dict(color='white', width=1)),
-        hovertemplate='%{x}<br>中位数收益: %{y:+.1f}%<extra></extra>',
-    ))
-    fig_bt.add_hline(y=0, line_dash="solid", line_color=C_MUTED, line_width=1)
-
-    layout_bt = dark_layout(height=420, y_title="收益率 (%)")
-    layout_bt['showlegend'] = True
-    layout_bt['legend'] = dict(
-        orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
-        font=dict(color=C_TEXT), bgcolor="rgba(0,0,0,0)",
-    )
-    fig_bt.update_layout(**layout_bt)
-    st.plotly_chart(fig_bt, use_container_width=True)
-
-    # ── 胜率图 ──
-    st.markdown(f"#### 🎯 持有 {selected} 的正收益胜率 (%)")
-    fig_win = go.Figure()
-
-    bar_opacities = [max(0.3, (w or 0) / 100) for w in wins]
-    fig_win.add_trace(go.Bar(
-        x=labels, y=wins,
-        marker_color=[f'rgba(41,98,255,{op:.2f})' for op in bar_opacities],
-        text=[f"{w:.0f}%" if not np.isnan(w) else "" for w in wins],
-        textposition='inside',
-        textfont=dict(color='white', size=13, family='Courier New, monospace'),
-        insidetextanchor='middle',
-        hovertemplate='%{x}<br>胜率: %{y:.0f}%<extra></extra>',
-    ))
-    fig_win.add_hline(
-        y=50, line_dash="dash", line_color="#FF9F0A", line_width=1.5,
-        annotation_text="50% 基准线", annotation_position="top right",
-        annotation_font_color="#FF9F0A",
-    )
-
-    layout_win = dark_layout(height=360, y_range=[0, 110], y_title="胜率 (%)")
-    fig_win.update_layout(**layout_win)
-    st.plotly_chart(fig_win, use_container_width=True)
-
-    # ── 四周期折线对比 ──
-    st.markdown("---")
-    st.markdown("#### 📈 不同持有周期的均值收益率对比（各区间）")
-    fig_multi = go.Figure()
-    period_colors = [C_BLUE, "#34C759", "#FF9F0A", "#FF3B30"]
-
-    for (pname, _), pcolor in zip(PERIODS, period_colors):
-        y_vals = [r.get(f'{pname}_avg', np.nan) for r in results]
-        fig_multi.add_trace(go.Scatter(
-            name=pname, x=labels, y=y_vals,
-            mode='lines+markers',
-            line=dict(color=pcolor, width=2),
-            marker=dict(size=8, color=pcolor),
-            hovertemplate=f'{pname}: %{{y:+.1f}}%<extra></extra>',
-        ))
-
-    fig_multi.add_hline(y=0, line_dash="solid", line_color=C_MUTED, line_width=1)
-
-    layout_multi = dark_layout(height=400, y_title="平均收益率 (%)")
-    layout_multi['showlegend'] = True
-    layout_multi['legend'] = dict(
-        orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
-        font=dict(color=C_TEXT), bgcolor="rgba(0,0,0,0)",
-    )
-    fig_multi.update_layout(**layout_multi)
-    st.plotly_chart(fig_multi, use_container_width=True)
-
-    st.markdown(
-        "<p style='color:#787b86;font-size:0.95rem;text-align:center;'>"
-        "⚠️ 历史收益不代表未来表现。本看板为个人研究工具，不构成任何投资建议。</p>",
-        unsafe_allow_html=True,
-    )
-
-# ──────────────────────────────────────────────
-# Tab 3: 华夏基金 OLS 预测核心 (全新增加)
-# ──────────────────────────────────────────────
-with tab3:
+def render_ols():
+    st.caption("OLS 为独立模块，不参与泡沫指数或两种百分位。当前基金接口最多取最近 60 条净值记录。")
     st.subheader("🔮 华夏全球科技先锋 (005698) 双因子 OLS 预测")
     st.markdown("""
     <p style='color:#787b86;font-size:1.0rem;'>
-    本模块自动抓取近期纳斯达克(NDX)、半导体(SOX)及该基金的实际每日涨跌幅，通过多元线性回归测算基金经理真实的底仓暴露度。
+    本模块自动抓取近期纳斯达克(NDX)、半导体(SOX)及该基金的实际每日涨跌幅，通过多元线性回归估计基金对两个指数的统计敏感度（不等同于实际持仓）。
     </p>
     """, unsafe_allow_html=True)
     
+    valid_data = pd.DataFrame()
+    model = None
     ols_data = fetch_ols_data()
     
     if ols_data.empty:
@@ -758,7 +597,7 @@ with tab3:
         col_table, col_model = st.columns([1.2, 1])
         
         with col_table:
-            st.markdown("**1. 数据清洗与校准** (已自动合并五一等假期错位，取消勾选可剔除极端值)")
+            st.markdown("**1. 数据清洗与校准** (按当前日期合并规则处理；取消勾选可排除样本)")
             
             # 调整显示顺序，加入区间标签
             display_cols = ['交易区间', 'NDX', 'SOX', 'Fund', '是否纳入回归']
@@ -768,7 +607,7 @@ with tab3:
                     "交易区间": st.column_config.TextColumn("交易区间"),
                     "是否纳入回归": st.column_config.CheckboxColumn("参与回归?", default=True)
                 },
-                use_container_width=True, height=300
+                width="stretch", height=300
             )
         
         # 运行回归
@@ -779,7 +618,7 @@ with tab3:
                 st.warning("⚠️ 请至少保留 5 天的有效数据以运行回归模型。")
             else:
                 X = valid_data[['NDX', 'SOX']]
-                X = sm.add_constant(X)
+                X = sm.add_constant(X, has_constant='add')
                 y = valid_data['Fund']
                 
                 model = sm.OLS(y, X).fit()
@@ -787,7 +626,7 @@ with tab3:
                 beta_ndx = model.params.get('NDX', 0)
                 beta_sox = model.params.get('SOX', 0)
                 
-                st.markdown("**2. 模型解析出来的真实底仓**")
+                st.markdown("**2. 模型估计的因子敏感度**")
                 st.info(f"**方程：** 基金收益 = {alpha:.2f}% + ({beta_ndx:.2f} × NDX) + ({beta_sox:.2f} × SOX)")
             
                 c1, c2, c3 = st.columns(3)
@@ -807,15 +646,146 @@ with tab3:
     with pred_col2:
         in_sox = st.number_input("👉 当日 SOX 涨跌幅 (%)", value=round(auto_sox, 2), step=0.1)
         
-    if len(valid_data) >= 5:
+    if model is not None and len(valid_data) >= 5:
         pred_val = alpha + beta_ndx * in_ndx + beta_sox * in_sox
-        pred_se = np.sqrt(model.mse_resid) 
+        pred_x = pd.DataFrame({'const': [1.0], 'NDX': [in_ndx], 'SOX': [in_sox]})
+        interval = model.get_prediction(pred_x[model.model.exog_names]).summary_frame(alpha=.05).iloc[0]
+        pred_low, pred_high = float(interval['obs_ci_lower']), float(interval['obs_ci_upper']) 
         
         with pred_col3:
-            st.markdown("**95% 置信区间预测结果：**")
+            st.markdown("**95% 预测区间结果：**")
             st.metric(
                 "核心预测值", 
                 f"{pred_val:.2f}%", 
-                f"波动范围: [{pred_val - 1.96*pred_se:.2f}%, {pred_val + 1.96*pred_se:.2f}%]", 
+                f"波动范围: [{pred_low:.2f}%, {pred_high:.2f}%]", 
                 delta_color="off"
             )
+
+
+C_BG       = "#131722"
+C_PANEL    = "#1e222d"
+C_BORDER   = "#2a2e39"
+C_BLUE     = "#2962ff"
+C_TEXT     = "#d1d4dc"
+C_MUTED    = "#787b86"
+
+ZONES = [
+    (0,   33,  "💎 极限大底/重仓 (<33)",  "#00FFFF"), 
+    (33,  39,  "🟩 大幅加仓机会 (33-39)", "#32CD32"),
+    (39,  41.5,"🟢 优质定投区域 (39-41.5)","#90EE90"),
+    (41.5,45,  "🟡 恐慌底部分界 (41.5-45)","#FFD700"),
+    (45,  52,  "📉 趋势变坏/下行 (45-52)", "#FF3B30"),
+    (52,  60,  "⚠️ 高位背离警告 (52-60)", "#FF9F0A"),
+    (60,  75,  "🔵 合理价位/持有 (60-75)", "#2962ff"),
+    (75,  101, "🚨 估值偏高/警惕 (>75)",   "#F7DC6F"),
+]
+PERIODS = [("1个月", 21), ("3个月", 63), ("6个月", 126), ("1年", 252)]
+
+def dark_layout(height=520, y_range=None, y_title=None, title_text=None):
+    """返回统一的深色 Plotly 布局字典"""
+    layout = dict(
+        height=height,
+        paper_bgcolor=C_BG,
+        plot_bgcolor=C_PANEL,
+        font=dict(color=C_TEXT, family="Courier New, monospace", size=15),
+        margin=dict(l=8, r=8, t=30 if title_text else 10, b=8),
+        hovermode="x unified",
+        hoverlabel=dict(font_size=15, font_family="Courier New, monospace"),
+        showlegend=False,
+        xaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
+        yaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
+    )
+    if y_range:
+        layout["yaxis"]["range"] = y_range
+    if y_title:
+        layout["yaxis"]["title"] = dict(text=y_title, font=dict(color=C_MUTED, size=15))
+    if title_text:
+        layout["title"] = dict(text=title_text, font=dict(color=C_TEXT, size=16), x=0, xanchor="left")
+    return layout
+
+
+if __name__ == "__main__":
+    st.set_page_config(page_title="AI泡沫指数 V3.1", page_icon="📈", layout="wide")
+    
+    # ============================================================
+    # Bloomberg / TradingView 深色主题 CSS
+    # ============================================================
+    st.markdown("""
+    <style>
+    /* 主背景 */
+    .stApp { background-color: #131722; color: #d1d4dc; }
+    
+    /* 侧边栏 */
+    section[data-testid="stSidebar"] {
+        background-color: #1e222d;
+        border-right: 1px solid #2a2e39;
+    }
+    section[data-testid="stSidebar"] * { color: #d1d4dc !important; }
+    
+    /* 指标卡片 */
+    [data-testid="metric-container"] {
+        background-color: #1e222d;
+        border: 1px solid #2a2e39;
+        border-radius: 8px;
+        padding: 16px 20px;
+    }
+    [data-testid="stMetricValue"] {
+        color: #d1d4dc !important;
+        font-family: 'Courier New', monospace !important;
+        font-size: 1.8rem !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stMetricLabel"] { color: #787b86 !important; font-size: 0.9rem !important; font-weight: 600 !important; }
+    [data-testid="stMetricDelta"] { font-family: 'Courier New', monospace !important; font-weight: 600 !important; }
+    
+    /* 标题 */
+    h1, h2, h3 { color: #d1d4dc !important; }
+    h1 { font-family: 'Courier New', monospace !important; border-bottom: 1px solid #2a2e39; padding-bottom: 8px; }
+    
+    /* 分割线 */
+    hr { border-color: #2a2e39 !important; }
+    
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        background-color: #1e222d;
+        border-bottom: 1px solid #2a2e39;
+        gap: 4px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        color: #787b86;
+        background-color: transparent;
+        border-radius: 6px 6px 0 0;
+        padding: 8px 20px;
+        font-family: 'Courier New', monospace;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #2962ff !important;
+        border-bottom: 2px solid #2962ff !important;
+        background-color: rgba(41,98,255,0.08) !important;
+    }
+    
+    /* Selectbox / Dropdown */
+    [data-baseweb="select"] { background-color: #1e222d !important; border-color: #2a2e39 !important; }
+    [data-baseweb="select"] * { color: #d1d4dc !important; background-color: #1e222d !important; }
+    
+    /* Dataframe */
+    [data-testid="stDataFrame"] { border: 1px solid #2a2e39; border-radius: 6px; }
+    
+    /* Spinner */
+    .stSpinner > div { border-top-color: #2962ff !important; }
+    
+    /* Slider */
+    [data-testid="stSlider"] [data-baseweb="slider"] [role="slider"] {
+        background-color: #2962ff !important;
+        border-color: #2962ff !important;
+    }
+    
+    /* Markdown */
+    .stMarkdown, p { color: #d1d4dc !important; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # ============================================================
+    # 设计常量
+    # ============================================================
+    render_main()
