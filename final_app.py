@@ -1,4 +1,4 @@
-"""AI bubble dashboard V3.2 / 完整模型与早期参考历史分开统计。"""
+"""AI bubble dashboard V3.2.2 / 境内与QDII主动基金的三个独立榜单。"""
 import json
 import hashlib
 import os
@@ -25,7 +25,7 @@ USER_CONFIG = {
     "SAVE_LOCAL_BACKUP": True,
     "BACKUP_DIR": "bubble_data",  # Relative to this script, not the working directory
 }
-MODEL_VERSION = "3.2-active-fund-screener"
+MODEL_VERSION = "3.2.2-domestic-and-qdii-screening"
 TICKERS = ["QQQ", "^VIX", "SPHB", "SPLV", "IPO", "SPY", "HYG", "IEF", "^TNX"]
 FACTOR_NAMES = {
     "P1": "QQQ 均线偏离", "P2": "VIX 倒数", "P3": "高低波动比",
@@ -325,7 +325,7 @@ def plot_index(frame):
 
 
 def render_main():
-    st.markdown("# 🛡️ 私人量化终端：AI 泡沫综合指数 V3.2")
+    st.markdown("# 🛡️ 私人量化终端：AI 泡沫综合指数 V3.2.2")
     st.sidebar.header("⚙️ 看板控制台")
     upload = st.sidebar.file_uploader("从历史备份读取（ZIP）", type=["zip"])
     if st.sidebar.button("重新获取行情"):
@@ -509,6 +509,7 @@ ACTIVE_TYPES = {
     "QDII-普通股票", "QDII-混合偏股", "QDII-混合平衡", "QDII-混合灵活",
     "股票型", "混合型-偏股", "混合型-平衡", "混合型-灵活",
 }
+FUND_SCOPES = ["全部主动基金（境内 + QDII）", "仅境内股票 / 混合（非QDII）", "仅主动 QDII"]
 PUBLIC_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://fund.eastmoney.com/"}
 
 
@@ -580,6 +581,30 @@ def active_candidates(catalog):
     passive = catalog["基金名称"].str.contains(r"指数|ETF|联接|标普|纳斯达克100|纳指100", case=False, na=False)
     other = catalog["基金名称"].str.contains(r"美元|港币|后端|FOF|REIT", case=False, na=False)
     return catalog.loc[catalog["基金类型"].isin(ACTIVE_TYPES) & ~passive & ~other].copy()
+
+
+def filter_fund_scope(frame, scope):
+    """Fund category is only an optional filter, never a benchmark assignment.
+    基金类别不决定入哪个指数榜；所有候选均分别对比三个基准。
+    """
+    qdii = frame["基金类型"].str.startswith("QDII", na=False)
+    if scope == FUND_SCOPES[1]:
+        return frame.loc[~qdii].copy()
+    if scope == FUND_SCOPES[2]:
+        return frame.loc[qdii].copy()
+    return frame.copy()
+
+
+def candidate_batch(codes, batch_number, batch_size=300):
+    """Deterministic coverage of a large universe without silently taking top N.
+    大候选池按代码稳定分批，界面明确本批范围，不冒充全市场排名。
+    """
+    ordered = sorted(set(codes))
+    total = max(1, (len(ordered) + batch_size - 1) // batch_size)
+    if not 1 <= batch_number <= total:
+        raise ValueError("批次超出候选范围。")
+    start = (batch_number - 1) * batch_size
+    return ordered[start:start + batch_size], total
 
 
 def parse_fund_nav(text, expected_code):
@@ -747,11 +772,72 @@ def compare_funds(navs, benchmarks, lookback, bonus_max=40, lag=0, maximum_stale
     return pd.DataFrame(records),paths,pd.DataFrame(errors),info
 
 
+def benchmark_ranking(ranking, benchmark, minimum_corr):
+    """Independent board: never pool, average or blend different benchmarks.
+    每个榜单仅按该指数的评分排序，同一基金可以进入多个榜单。
+    """
+    selected = ranking.loc[(ranking["比较基准"] == benchmark)
+                           & (ranking["收益相关系数"] >= minimum_corr)].copy()
+    selected = selected.sort_values(["综合得分", "基金代码"], ascending=[False, True]).reset_index(drop=True)
+    selected.insert(0, "排名", np.arange(1, len(selected) + 1))
+    return selected
+
+
+def render_benchmark_board(ranking, chosen, result, catalog, kind, currency):
+    st.markdown(f"**与{chosen}相似的主动基金**")
+    st.caption(f"本页全部分数、超额收益与曲线只对比{chosen}，不混入其他指数的评分。")
+    minimum_corr = st.slider(f"{chosen} · 最低收益相关系数", min_value=0.0, max_value=1.0,
+                            value=.6, step=.05, key=f"fund_corr_{chosen}")
+    scope = st.selectbox(f"{chosen} · 显示基金类别", FUND_SCOPES, key=f"board_scope_{chosen}")
+    board = benchmark_ranking(filter_fund_scope(ranking, scope), chosen, minimum_corr)
+    display_cols = ["排名", "基金代码", "基金名称", "基金类别", "基金类型", "综合得分", "相似度分", "稳定超额加分", "收益相关系数",
+                    "基金收益(%)", "基准收益(%)", "超额收益(百分点)", "分段跑赢比例(%)", "完整分段数", "最大回撤(%)", "Beta"]
+    if board.empty:
+        st.info(f"没有满足{chosen}相关系数门槛的基金，可调整本页阈值或候选范围。")
+        return
+    display = board[display_cols].rename(columns={"综合得分": "本指数得分", "基准收益(%)": f"{chosen}收益(%)"})
+    st.dataframe(display.round(3), hide_index=True, width="stretch")
+    options = board["基金代码"].tolist()
+    plot_key = f"fund_plot_codes_{chosen}"
+    selection_defaults = {}
+    if plot_key in st.session_state:
+        kept = [c for c in st.session_state[plot_key] if c in options]
+        if kept != st.session_state[plot_key]:
+            st.session_state[plot_key] = kept
+    else:
+        selection_defaults["default"] = options[:3]
+    selected_plot = st.multiselect(f"{chosen} · 叠加基金曲线", options, key=plot_key, **selection_defaults)
+    figure = go.Figure()
+    b = result["paths"][chosen]
+    figure.add_trace(go.Scatter(x=b.index, y=(b-1)*100, name=chosen, line=dict(color="#F7DC6F", width=3)))
+    names = catalog.set_index("基金代码")["基金名称"]
+    for code in selected_plot:
+        path = result["paths"][code]
+        figure.add_trace(go.Scatter(x=path.index, y=(path-1)*100, name=f"{code} {names.loc[code]}"))
+    figure.update_layout(**dark_layout(height=450, y_title="共同起点累计收益 (%)"))
+    figure.update_layout(showlegend=True, legend=dict(orientation="h", y=-.2))
+    st.plotly_chart(figure, width="stretch", key=f"fund_chart_{chosen}")
+    info = result["info"]
+    export = display.copy()
+    export["比较基准"] = chosen
+    export["口径"] = kind
+    export["币种"] = currency
+    export["实际开始"] = info["实际开始"]
+    export["实际结束"] = info["实际结束"]
+    export["共同收益区间数"] = info["共同收益区间数"]
+    export["计算时间"] = result["computed_at"]
+    export["支付宝状态"] = "上架及实时额度未核验，请在支付宝自行确认"
+    st.download_button(f"下载{chosen}榜单 CSV", export.to_csv(index=False).encode("utf-8-sig"),
+                       f"fund_ranking_{BENCHMARKS[chosen]['proxy']}.csv", "text/csv", key=f"fund_export_{chosen}")
+
+
 def render_fund_screener():
     st.subheader("主动基金 · 纳指100 / 费半 / 标普500 相似度筛选")
     st.caption("按历史相似度与持续超额收益排序，基金在支付宝的上架及额度由你最终确认。"
                "本模块独立于泡沫指数，不改变原模型或百分位。")
     st.caption("净值来自天天基金公开数据；本榜不代表支付宝在售清单，也不核验实时限额。")
+    st.caption("默认同时搜索境内主动股票/混合基金与主动 QDII。无需名称含科技、半导体或海外，"
+               "也不要求持有美股；是否进入三个榜单，由实际收益路径分别决定。")
     if st.button("加载 / 刷新主动基金目录",key="load_fund_catalog"):
         fetch_fund_catalog.clear()
         try: st.session_state["fund_catalog"]=fetch_fund_catalog()
@@ -762,15 +848,16 @@ def render_fund_screener():
         return
     candidates=active_candidates(catalog)
     with st.expander("主动基金候选目录（不代表支付宝在售）",expanded=True):
-        scope=st.radio("候选范围",["主动 QDII","主动股票 / 混合（含境内）"],horizontal=True,key="fund_scope")
-        subset=candidates[candidates["基金类型"].str.startswith("QDII")] if scope=="主动 QDII" else candidates
+        scope=st.radio("候选范围",FUND_SCOPES,horizontal=True,key="fund_scope_v322")
+        subset=filter_fund_scope(candidates,scope)
         search=st.text_input("搜索基金名称或代码",key="fund_search")
         if search.strip(): subset=subset[subset["基金名称"].str.contains(search.strip(),regex=False)|subset["基金代码"].str.contains(search.strip(),regex=False)]
         st.caption(f"符合条件 {len(subset):,} 个份额。已排除名称/类型明确为指数、ETF、联接及非人民币份额；"
                    "A/C 份额分别计分，不应视为不同投资策略。主动属性最终以基金说明书为准。")
         all_candidates=st.checkbox("比较当前筛选目录的全部基金",value=False,key="all_fund_candidates")
+        name_lookup=catalog.set_index("基金代码")["基金名称"].to_dict()
         selected=st.multiselect("加入比较的基金",subset["基金代码"].tolist(),
-                   format_func=lambda c:f"{c} · {catalog.set_index('基金代码').loc[c,'基金名称']}",key="selected_funds")
+                   format_func=lambda c:f"{c} · {name_lookup[c]}",key="selected_funds")
         st.dataframe(subset,hide_index=True,width="stretch",height=220)
     text=st.text_area("补充基金代码（六位，逗号或换行分隔）",key="fund_codes",placeholder="填写你关注的主动基金代码")
     if all_candidates: selected=subset["基金代码"].tolist()
@@ -784,8 +871,14 @@ def render_fund_screener():
     codes=[c for c in codes if c in allowed]
     if not codes: return
     if len(codes)>300:
-        st.error("单次最多比较 300 个份额，请缩小候选范围。")
-        return
+        total_candidates=len(codes)
+        total_batches=(total_candidates+299)//300
+        batch_no=int(st.number_input("扫描批次（每批最多 300 个份额）",min_value=1,max_value=total_batches,
+                     value=1,step=1,key=f"fund_batch_{hashlib.sha256('|'.join(sorted(codes)).encode()).hexdigest()[:10]}"))
+        codes,_=candidate_batch(codes,batch_no)
+        st.info(f"当前候选共 {total_candidates:,} 个份额，分 {total_batches} 批。"
+                f"本次仅计算第 {batch_no} 批（代码 {codes[0]}–{codes[-1]}）；按代码分批，不按名称或地区预先挑选。"
+                "更换批次需重新计算，各批结果可单独导出；未自动扫描或合并全部批次。")
     st.caption(f"本次候选 {len(codes)} 个份额；点击计算后才获取其净值。")
     c1,c2,c3=st.columns(3)
     lookback=int(c1.number_input("回看美股交易日数",min_value=60,max_value=1500,value=200,step=1,key="fund_lookback"))
@@ -794,7 +887,9 @@ def render_fund_screener():
     c1,c2,c3=st.columns(3)
     kind=c1.selectbox("比较口径",["ETF复权收益代理","原始价格指数"],key="fund_kind")
     currency=c2.selectbox("比较币种",["人民币","美元指数对人民币基金（未校正）"],key="fund_currency")
-    lag=c3.selectbox("基金日期对应美股日期",[0,1],format_func=lambda x:"同一日期（QDII 默认）" if x==0 else "前一个美股交易日",key="fund_lag")
+    lag=c3.selectbox("基金日期对应美股日期",[0,1],format_func=lambda x:"同一日期（事后走势对比）" if x==0 else "前一个美股交易日",key="fund_lag")
+    st.caption("境内收盘早于同日美股收盘。默认按同一日期做事后形态比较；若研究境内对前夜美股的反应，"
+               "请选前一个美股交易日。同一批采用固定口径，不为每只基金寻找最优时滞。")
     if kind=="ETF复权收益代理":
         st.caption("基准分别为 QQQ、SOXQ、SPY 的复权行情，近似包含分红再投资及 ETF 费用；"
                    "是对应指数的收益代理，不是指数本体。")
@@ -843,37 +938,22 @@ def render_fund_screener():
     st.caption(f"请求 {info['请求开始']} 至 {info['请求结束']}；共同有效日期 {info['实际开始']} 至 {info['实际结束']}，"
                f"共 {info['共同收益区间数']} 个收益区间。所有基金与基准使用相同日期，长假期间收益按实际间隔累计。")
     st.caption("计算时间："+result["computed_at"]+"；这是当前候选集合的历史描述性排名，不是全市场排名或未来收益预测。")
-    chosen=st.selectbox("查看哪个基准的排名",list(BENCHMARKS),key="rank_benchmark")
-    minimum_corr=st.slider("最低收益相关系数",min_value=0.0,max_value=1.0,value=.6,step=.05,key="fund_corr")
     ranking=ranking.merge(catalog,on="基金代码",how="left",validate="many_to_one")
-    ranking=ranking[(ranking["比较基准"]==chosen)&(ranking["收益相关系数"]>=minimum_corr)].sort_values("综合得分",ascending=False)
-    display_cols=["基金代码","基金名称","综合得分","相似度分","稳定超额加分","收益相关系数",
-                  "基金收益(%)","基准收益(%)","超额收益(百分点)","分段跑赢比例(%)","完整分段数","最大回撤(%)","Beta"]
-    st.markdown("**主动基金相似度排名**")
-    if ranking.empty: st.info("没有满足最低相关系数的基金，可调整阈值或候选范围。")
-    else: st.dataframe(ranking[display_cols].round(3),hide_index=True,width="stretch")
-    if not ranking.empty:
-        options=ranking["基金代码"].tolist()
-        selected_plot=st.multiselect("叠加收益曲线",options,default=options[:3],key="fund_plot_codes")
-        figure=go.Figure()
-        b=result["paths"][chosen]
-        figure.add_trace(go.Scatter(x=b.index,y=(b-1)*100,name=chosen,line=dict(color="#F7DC6F",width=3)))
-        for code in selected_plot:
-            path=result["paths"][code]
-            figure.add_trace(go.Scatter(x=path.index,y=(path-1)*100,name=f"{code} {catalog.set_index('基金代码').loc[code,'基金名称']}"))
-        figure.update_layout(**dark_layout(height=450,y_title="共同起点累计收益 (%)"))
-        figure.update_layout(showlegend=True,legend=dict(orientation="h",y=-.2))
-        st.plotly_chart(figure,width="stretch")
-        export=ranking[display_cols].copy()
-        export["口径"]=kind; export["币种"]=currency
-        export["实际开始"]=info["实际开始"]; export["实际结束"]=info["实际结束"]
-        export["共同收益区间数"]=info["共同收益区间数"]; export["计算时间"]=result["computed_at"]
-        export["支付宝状态"]="上架及实时额度未核验，请在支付宝自行确认"
-        st.download_button("下载当前基准筛选结果 CSV",export.to_csv(index=False).encode("utf-8-sig"),"fund_similarity_ranking.csv","text/csv")
+    ranking["基金类别"]=np.where(ranking["基金类型"].str.startswith("QDII",na=False),"主动 QDII","境内股票/混合（非QDII）")
+    st.markdown("### 三个独立相似度榜单")
+    st.caption("分别评分、分别排名，不合成三个指数。一只基金若同时接近多个指数，可以出现在多个榜单；"
+               "各榜的相关性门槛、叠加曲线和下载文件独立。")
+    st.caption("基金类别按公开分类标记，非QDII不等于已核验全部持仓均为A股。"
+               "历史相似是研究线索，不代表未来始终同步或已确认存在超额收益机会。")
+    board_names = list(BENCHMARKS)
+    board_tabs = st.tabs([f"{name}相似基金" for name in board_names])
+    for board_tab, chosen in zip(board_tabs, board_names):
+        with board_tab:
+            render_benchmark_board(ranking, chosen, result, catalog, kind, currency)
     with st.expander("评分方法与数据来源"):
         st.markdown("相似度满分 **100**：55% 收益相关性＋25% 累计路径接近度＋20% 最终收益接近度。"
                     "路径与最终收益差按 10 个百分点尺度指数衰减，负相关不加相关性分。")
-        st.markdown(f"稳定超额最多加 **{bonus:g}** 分：总超额为正、相关系数至少 0.6，且至少三个互不重叠的 "
+        st.markdown(f"每个指数独立计算稳定超额，最多加 **{bonus:g}** 分：总超额为正、相关系数至少 0.6，且至少三个互不重叠的 "
                     "20 区间分段中，超过一半跑赢，才按超额幅度和持续性加分。综合得分可超过 100；分数不是成功概率。")
         st.caption("基金使用公布的日增长率复利连乘，避免把未复权单位净值或累计净值比值误当总收益。"
                    "未扣个人申购赎回费。回撤按共同采样日期估计，可能低估日期间回撤。"
@@ -929,7 +1009,7 @@ def dark_layout(height=520, y_range=None, y_title=None, title_text=None):
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="AI泡沫指数 V3.2", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="AI泡沫指数 V3.2.2", page_icon="📈", layout="wide")
     
     # ============================================================
     # Bloomberg / TradingView 深色主题 CSS
