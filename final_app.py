@@ -1,4 +1,4 @@
-"""AI bubble dashboard V3.3 / 境内与QDII主动基金的三个独立榜单。"""
+"""AI bubble dashboard V3.3.1 / GitHub仓库备份自动读取。"""
 import json
 import hashlib
 import os
@@ -24,8 +24,9 @@ USER_CONFIG = {
     "MISSING_POLICY": "legacy",  # legacy 保持原版前向填充；strict 不补值（会改变部分读数）
     "SAVE_LOCAL_BACKUP": True,
     "BACKUP_DIR": "bubble_data",  # Relative to this script, not the working directory
+    "FUND_REPO_BACKUP": "fund_screen_backup.zip",  # GitHub-tracked ZIP next to app.py / 同仓库固定备份
 }
-MODEL_VERSION = "3.3-monthly-universe-scan"
+MODEL_VERSION = "3.3.1-repository-backup"
 TICKERS = ["QQQ", "^VIX", "SPHB", "SPLV", "IPO", "SPY", "HYG", "IEF", "^TNX"]
 FACTOR_NAMES = {
     "P1": "QQQ 均线偏离", "P2": "VIX 倒数", "P3": "高低波动比",
@@ -325,7 +326,7 @@ def plot_index(frame):
 
 
 def render_main():
-    st.markdown("# 🛡️ 私人量化终端：AI 泡沫综合指数 V3.3")
+    st.markdown("# 🛡️ 私人量化终端：AI 泡沫综合指数 V3.3.1")
     st.sidebar.header("⚙️ 看板控制台")
     upload = st.sidebar.file_uploader("从历史备份读取（ZIP）", type=["zip"])
     if st.sidebar.button("重新获取行情"):
@@ -1138,6 +1139,44 @@ def next_full_due(state):
     return pd.Timestamp.now(tz="UTC") >= pd.Timestamp(state["full_at"]) + pd.DateOffset(months=1)
 
 
+def reset_fund_widgets():
+    for key in ("fund_lookback", "fund_bonus", "fund_kind", "fund_currency", "fund_lag",
+                "fund_buffer", "fund_pool_corr", "fund_auto"):
+        st.session_state.pop(key, None)
+
+
+def sync_repo_fund_backup(force=False):
+    """Restore a GitHub-tracked seed when its content changes or local results are lost.
+    仓库备份只读；相同文件不反复覆盖网页上刷新的结果，不向GitHub写入。
+    """
+    name = USER_CONFIG.get("FUND_REPO_BACKUP", "")
+    if not name: return False
+    source = Path(__file__).resolve().parent / name
+    if not source.is_file():
+        if force: raise ValueError("未找到仓库备份，请将 fund_screen_backup.zip 放到 app.py 同目录并提交。")
+        return False
+    if source.stat().st_size > 20_000_000:
+        raise ValueError("仓库基金备份超过20MB，请使用本应用导出的基金榜单ZIP。")
+    content = source.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    marker_path = FUND_STORE / "repo_source.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        marker = {}
+    try:
+        state = read_fund_state()
+        ready = bool(load_fund_snapshot(state.get("latest")) and load_fund_snapshot(state.get("full")))
+    except (OSError, ValueError, KeyError):
+        ready = False
+    if not force and ready and marker.get("sha256") == digest:
+        return False
+    restore_fund_backup(content)  # Validate archive before updating local state.
+    atomic_json(marker_path, {"sha256": digest, "file": name,
+                              "loaded_at": datetime.now(timezone.utc).isoformat()})
+    return True
+
+
 def render_saved_fund_result(snapshot):
     params = snapshot["params"]; cov = snapshot["coverage"]; info = snapshot["info"]
     saved_time = pd.Timestamp(snapshot["computed_at"]).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S") + "（北京时间）"
@@ -1187,6 +1226,12 @@ def render_saved_fund_result(snapshot):
 
 def render_fund_screener():
     st.subheader("主动基金 · 月度全量扫描与三个独立候选池")
+    try:
+        if sync_repo_fund_backup():
+            reset_fund_widgets()
+            st.success("已自动加载仓库中的基金备份。后续替换 GitHub 上同名ZIP即可更新已保存榜单。")
+    except Exception as exc:
+        st.warning(f"仓库备份未能加载，已有本地榜单继续保留：{exc}")
     if st.session_state.pop("fund_scan_saved_notice", False):
         st.success("已保存。下次打开网页直接读取榜单；全量扫描进度也已保留。")
     st.caption("境内主动股票/混合 + 主动QDII，不按名称或持仓地区预选。每月全面发现候选，平时仅刷新三个前50的去重并集（最多150个份额）。")
@@ -1196,6 +1241,16 @@ def render_fund_screener():
     except Exception as exc:
         st.error(f"保存结果读取失败，请从基金榜单ZIP恢复：{exc}"); state = {}; snapshot = None
     with st.expander("保存与恢复"):
+        st.caption("GitHub长期保存：将 fund_screen_backup.zip 与 app.py 放在部署分支的同一目录。"
+                   "首次启动、本地结果丢失或仓库ZIP内容变化时自动加载；相同ZIP不会覆盖网页上刚刷新的结果。"
+                   "更新后请下载新ZIP，并自行覆盖提交到GitHub；网页不会自动写回仓库。")
+        if st.button("重新读取仓库备份", key="reload_repo_fund_backup",
+                     help="用GitHub已同步到服务器的备份替换当前本地榜单；仓库改动需先提交并等待部署同步。"):
+            try:
+                sync_repo_fund_backup(force=True)
+                reset_fund_widgets()
+                st.rerun()
+            except Exception as exc: st.error(f"读取失败：{exc}")
         st.caption("扫描检查点与榜单保存在运行服务器的 fund_data 目录。Streamlit Cloud休眠/重建后不保证本地文件保留，"
                    "请下载基金榜单备份；它包含月度候选池、已完成评分及最近结果，不包含未完成扫描的检查点。")
         if snapshot:
@@ -1204,9 +1259,7 @@ def render_fund_screener():
         if upload is not None and st.button("恢复该基金榜单备份"):
             try:
                 restore_fund_backup(upload.getvalue())
-                for key in ("fund_lookback", "fund_bonus", "fund_kind", "fund_currency", "fund_lag",
-                            "fund_buffer", "fund_pool_corr", "fund_auto"):
-                    st.session_state.pop(key, None)
+                reset_fund_widgets()
                 st.rerun()
             except Exception as exc: st.error(f"恢复失败：{exc}")
     initial = {**SCAN_DEFAULTS, **(snapshot or {}).get("params", {})}
@@ -1325,7 +1378,7 @@ def dark_layout(height=520, y_range=None, y_title=None, title_text=None):
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="AI泡沫指数 V3.3", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="AI泡沫指数 V3.3.1", page_icon="📈", layout="wide")
     
     # ============================================================
     # Bloomberg / TradingView 深色主题 CSS
