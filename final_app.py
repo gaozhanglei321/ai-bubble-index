@@ -1,4 +1,4 @@
-"""AI bubble dashboard V3.2.2 / 境内与QDII主动基金的三个独立榜单。"""
+"""AI bubble dashboard V3.3 / 境内与QDII主动基金的三个独立榜单。"""
 import json
 import hashlib
 import os
@@ -25,7 +25,7 @@ USER_CONFIG = {
     "SAVE_LOCAL_BACKUP": True,
     "BACKUP_DIR": "bubble_data",  # Relative to this script, not the working directory
 }
-MODEL_VERSION = "3.2.2-domestic-and-qdii-screening"
+MODEL_VERSION = "3.3-monthly-universe-scan"
 TICKERS = ["QQQ", "^VIX", "SPHB", "SPLV", "IPO", "SPY", "HYG", "IEF", "^TNX"]
 FACTOR_NAMES = {
     "P1": "QQQ 均线偏离", "P2": "VIX 倒数", "P3": "高低波动比",
@@ -325,7 +325,7 @@ def plot_index(frame):
 
 
 def render_main():
-    st.markdown("# 🛡️ 私人量化终端：AI 泡沫综合指数 V3.2.2")
+    st.markdown("# 🛡️ 私人量化终端：AI 泡沫综合指数 V3.3")
     st.sidebar.header("⚙️ 看板控制台")
     upload = st.sidebar.file_uploader("从历史备份读取（ZIP）", type=["zip"])
     if st.sidebar.button("重新获取行情"):
@@ -831,139 +831,455 @@ def render_benchmark_board(ranking, chosen, result, catalog, kind, currency):
                        f"fund_ranking_{BENCHMARKS[chosen]['proxy']}.csv", "text/csv", key=f"fund_export_{chosen}")
 
 
-def render_fund_screener():
-    st.subheader("主动基金 · 纳指100 / 费半 / 标普500 相似度筛选")
-    st.caption("按历史相似度与持续超额收益排序，基金在支付宝的上架及额度由你最终确认。"
-               "本模块独立于泡沫指数，不改变原模型或百分位。")
-    st.caption("净值来自天天基金公开数据；本榜不代表支付宝在售清单，也不核验实时限额。")
-    st.caption("默认同时搜索境内主动股票/混合基金与主动 QDII。无需名称含科技、半导体或海外，"
-               "也不要求持有美股；是否进入三个榜单，由实际收益路径分别决定。")
-    if st.button("加载 / 刷新主动基金目录",key="load_fund_catalog"):
-        fetch_fund_catalog.clear()
-        try: st.session_state["fund_catalog"]=fetch_fund_catalog()
-        except Exception as exc: st.error(f"基金目录获取失败：{exc}")
-    catalog=st.session_state.get("fund_catalog")
-    if catalog is None:
-        st.caption("点击上方加载目录，再筛选候选基金或输入自己的代码。不会自动下载全部基金净值。")
-        return
-    candidates=active_candidates(catalog)
-    with st.expander("主动基金候选目录（不代表支付宝在售）",expanded=True):
-        scope=st.radio("候选范围",FUND_SCOPES,horizontal=True,key="fund_scope_v322")
-        subset=filter_fund_scope(candidates,scope)
-        search=st.text_input("搜索基金名称或代码",key="fund_search")
-        if search.strip(): subset=subset[subset["基金名称"].str.contains(search.strip(),regex=False)|subset["基金代码"].str.contains(search.strip(),regex=False)]
-        st.caption(f"符合条件 {len(subset):,} 个份额。已排除名称/类型明确为指数、ETF、联接及非人民币份额；"
-                   "A/C 份额分别计分，不应视为不同投资策略。主动属性最终以基金说明书为准。")
-        all_candidates=st.checkbox("比较当前筛选目录的全部基金",value=False,key="all_fund_candidates")
-        name_lookup=catalog.set_index("基金代码")["基金名称"].to_dict()
-        selected=st.multiselect("加入比较的基金",subset["基金代码"].tolist(),
-                   format_func=lambda c:f"{c} · {name_lookup[c]}",key="selected_funds")
-        st.dataframe(subset,hide_index=True,width="stretch",height=220)
-    text=st.text_area("补充基金代码（六位，逗号或换行分隔）",key="fund_codes",placeholder="填写你关注的主动基金代码")
-    if all_candidates: selected=subset["基金代码"].tolist()
-    codes=list(dict.fromkeys(selected+re.findall(r"(?<!\d)\d{6}(?!\d)",text)))
-    if not codes:
-        st.caption("先从目录选择基金、选择全部当前候选，或输入代码。")
-        return
-    allowed=set(candidates["基金代码"])
-    rejected=[c for c in codes if c not in allowed]
-    if rejected: st.warning("以下代码未通过主动人民币份额筛选，已排除："+", ".join(rejected))
-    codes=[c for c in codes if c in allowed]
-    if not codes: return
-    if len(codes)>300:
-        total_candidates=len(codes)
-        total_batches=(total_candidates+299)//300
-        batch_no=int(st.number_input("扫描批次（每批最多 300 个份额）",min_value=1,max_value=total_batches,
-                     value=1,step=1,key=f"fund_batch_{hashlib.sha256('|'.join(sorted(codes)).encode()).hexdigest()[:10]}"))
-        codes,_=candidate_batch(codes,batch_no)
-        st.info(f"当前候选共 {total_candidates:,} 个份额，分 {total_batches} 批。"
-                f"本次仅计算第 {batch_no} 批（代码 {codes[0]}–{codes[-1]}）；按代码分批，不按名称或地区预先挑选。"
-                "更换批次需重新计算，各批结果可单独导出；未自动扫描或合并全部批次。")
-    st.caption(f"本次候选 {len(codes)} 个份额；点击计算后才获取其净值。")
-    c1,c2,c3=st.columns(3)
-    lookback=int(c1.number_input("回看美股交易日数",min_value=60,max_value=1500,value=200,step=1,key="fund_lookback"))
-    end_date=c2.date_input("筛选截止日期",value=pd.Timestamp.now(tz="Asia/Shanghai").date(), max_value=pd.Timestamp.now(tz="Asia/Shanghai").date(),key="fund_end_date")
-    bonus=float(c3.number_input("稳定超额最高加分",min_value=0.0,max_value=50.0,value=40.0,step=1.0,key="fund_bonus"))
-    c1,c2,c3=st.columns(3)
-    kind=c1.selectbox("比较口径",["ETF复权收益代理","原始价格指数"],key="fund_kind")
-    currency=c2.selectbox("比较币种",["人民币","美元指数对人民币基金（未校正）"],key="fund_currency")
-    lag=c3.selectbox("基金日期对应美股日期",[0,1],format_func=lambda x:"同一日期（事后走势对比）" if x==0 else "前一个美股交易日",key="fund_lag")
-    st.caption("境内收盘早于同日美股收盘。默认按同一日期做事后形态比较；若研究境内对前夜美股的反应，"
-               "请选前一个美股交易日。同一批采用固定口径，不为每只基金寻找最优时滞。")
-    if kind=="ETF复权收益代理":
-        st.caption("基准分别为 QQQ、SOXQ、SPY 的复权行情，近似包含分红再投资及 ETF 费用；"
-                   "是对应指数的收益代理，不是指数本体。")
-    else:
-        st.warning("NDX、SOX、GSPC 是价格指数，不含股息再投资；基金公布增长率与其收益口径不同，超额不能直接解释为管理能力。")
-    if currency=="人民币": st.caption("人民币基准≈美元基准×USD/CNY 市场汇率；不代表基金使用的精确估值汇率或对冲结果。")
-    else: st.warning("未统一币种，汇率变化会影响收益差与排名。")
-    included=codes
-    signature=hashlib.sha256(json.dumps({"codes":included,"lookback":lookback,"kind":kind,"currency":currency,"lag":lag,"bonus":bonus,"end":str(end_date)},sort_keys=True).encode()).hexdigest()
-    if st.button("计算相似度与排名",type="primary",key="run_fund_screen"):
-        if not included:
-            st.warning("请先选择基金。")
+# Monthly universe scan / 月度全量扫描。Only standard-library persistence is used.
+import sqlite3
+import time
+import threading
+import uuid
+from concurrent.futures import wait, FIRST_COMPLETED
+
+FUND_STORE = Path(__file__).resolve().parent / "fund_data"
+SCAN_SCHEMA = 1
+SCAN_DEFAULTS = {"lookback": 200, "bonus": 40.0, "lag": 0,
+                 "kind": "ETF复权收益代理", "currency": "人民币", "publication_buffer": 2,
+                 "pool_min_corr": .6, "workers": 6, "auto": True}
+_nav_local = threading.local()
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_fund_state():
+    path = FUND_STORE / "state.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def pack_series(series):
+    return {"dates": series.index.strftime("%Y-%m-%d").tolist(), "values": series.astype(float).tolist()}
+
+
+def unpack_series(data):
+    s = pd.Series(data["values"], index=pd.to_datetime(data["dates"]), dtype=float)
+    if s.index.has_duplicates or not s.index.is_monotonic_increasing or not np.isfinite(s).all() or (s <= 0).any():
+        raise ValueError("备份曲线的日期或数值无效。")
+    return s
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cn_calendar(start, end):
+    raw = yf.download("000001.SS", start=start, end=end, auto_adjust=True, progress=False)
+    if raw is None or raw.empty:
+        raise ValueError("无法获得境内交易日历，不能固定共同日期。")
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+    return pd.DatetimeIndex(close.dropna().index).tz_localize(None).normalize()
+
+
+def fixed_scan_grid(benchmarks, cn_dates, settings):
+    # Freeze independently of fund membership. A bad fund cannot move everyone else's window.
+    base = benchmarks.dropna().sort_index()
+    if settings["lag"]: base = base.shift(settings["lag"]).dropna()
+    buffer = int(settings["publication_buffer"])
+    if buffer: base = base.iloc[:-buffer]
+    n = int(settings["lookback"])
+    if len(base) < n + 1: raise ValueError("基准历史不足请求窗口及净值公布缓冲期。")
+    requested = base.tail(n + 1)
+    dates = requested.index.intersection(cn_dates).sort_values()
+    if len(dates) < max(31, int(.7 * len(requested))):
+        raise ValueError("境内/美股共同交易日不足，不缩短窗口生成排名。")
+    grid = requested.loc[dates]
+    info = {"请求开始": str(requested.index[0].date()), "请求结束": str(requested.index[-1].date()),
+            "实际开始": str(dates[0].date()), "实际结束": str(dates[-1].date()),
+            "共同收益区间数": len(dates) - 1, "固定时滞": settings["lag"]}
+    return grid, info
+
+
+def fetch_scan_nav(code):
+    """One bounded, retryable request per fund; reuse connections per worker.
+    历史分页接口每页仅20条；本接口一次取回历史，只将评分窗口写入检查点。
+    """
+    if not re.fullmatch(r"\d{6}", code): raise ValueError("无效基金代码")
+    if not hasattr(_nav_local, "session"):
+        _nav_local.session = requests.Session()
+        _nav_local.session.headers.update(PUBLIC_HEADERS)
+    for attempt in range(2):
+        try:
+            response = _nav_local.session.get(f"https://fund.eastmoney.com/pingzhongdata/{code}.js", timeout=(6, 20))
+            response.raise_for_status()
+            response.encoding = "utf-8-sig"
+            return parse_fund_nav(response.text, code)
+        except requests.RequestException:
+            if attempt: raise
+            time.sleep(1)
+
+
+def evaluate_scan_fund(code, nav, grid, bonus):
+    if nav.empty or nav.index[0] > grid.index[0]:
+        raise ValueError("历史不足统一起点")
+    if not grid.index.isin(nav.index).all():
+        missing = grid.index.difference(nav.index)
+        raise ValueError(f"缺少统一采样日期 {len(missing)} 天（首个 {missing[0].date()}），未补造收益")
+    window = nav.loc[grid.index[0]:grid.index[-1]]
+    if (window["nav"] <= 0).any(): raise ValueError("非正净值")
+    wealth = fund_wealth(window, grid.index[0], grid.index[-1]).reindex(grid.index)
+    wealth = wealth / wealth.iloc[0]
+    rows = [{"基金代码": code, "比较基准": name, **score_pair(wealth, grid[name], bonus)} for name in BENCHMARKS]
+    # JSON cannot carry NaN: >=60 returns still needs >=3 complete 20-interval blocks for a bonus.
+    rows = json.loads(pd.DataFrame(rows).to_json(orient="records", force_ascii=False, double_precision=12))
+    return {"status": "ok", "rows": rows, "path": pack_series(wealth)}
+
+
+def _scan_one(code, grid, bonus):
+    try:
+        nav = fetch_scan_nav(code)
+    except Exception as exc:
+        return {"status": "retry", "reason": f"净值获取/解析失败：{exc}"}
+    try:
+        return evaluate_scan_fund(code, nav, grid, bonus)
+    except ValueError as exc:
+        return {"status": "excluded", "reason": str(exc)}
+
+
+def open_scan_db(job_id):
+    if not re.fullmatch(r"[0-9a-f]{24}", job_id): raise ValueError("无效扫描标识")
+    FUND_STORE.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(FUND_STORE / f"scan_{job_id}.sqlite", timeout=30)
+    db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS outcomes (code TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+    return db
+
+
+def scan_lease(owner=None):
+    """Cross-session/process lease: only one scan writes shared state at a time."""
+    FUND_STORE.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(FUND_STORE / "control.sqlite", timeout=30)
+    db.execute("CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY, owner TEXT, expiry REAL)")
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT owner,expiry FROM lease WHERE id=1").fetchone()
+    now = time.time()
+    if row and row[1] > now and row[0] != owner:
+        db.close(); raise ValueError("另一会话正在扫描，请稍后查看保存结果；中断后的占用最多两分钟自动释放。")
+    owner = owner or uuid.uuid4().hex
+    db.execute("INSERT OR REPLACE INTO lease VALUES (1,?,?)", (owner, now + 120))
+    db.commit(); db.close()
+    return owner
+
+
+def release_scan_lease(owner):
+    db = sqlite3.connect(FUND_STORE / "control.sqlite")
+    try:
+        db.execute("DELETE FROM lease WHERE owner=?", (owner,))
+        db.commit()
+    finally:
+        db.close()
+
+
+def prepare_scan(catalog, settings, mode, end_date, previous=None, nonce=""):
+    eligible = active_candidates(catalog)
+    pools = (previous or {}).get("pools", {})
+    codes = sorted(eligible["基金代码"].tolist()) if mode == "full" else sorted({c for pool in pools.values() for c in pool})
+    if not codes: raise ValueError("候选池为空，请先运行全量扫描。")
+    # Update must keep the methodology and membership selected by the last full scan.
+    params = {k: settings[k] for k in SCAN_DEFAULTS if k not in ("auto", "workers")}
+    signature = {"schema": SCAN_SCHEMA, "params": params, "codes": codes,
+                 "mode": mode, "end": str(end_date), "pools": pools if mode != "full" else {}, "nonce": nonce}
+    job_id = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:24]
+    db = open_scan_db(job_id)
+    stored = db.execute("SELECT value FROM meta WHERE key='job'").fetchone()
+    db.close()
+    if stored:
+        return job_id, json.loads(stored[0])
+    end = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+    start = end - pd.Timedelta(days=int(params["lookback"] * 1.9) + 120)
+    benchmarks = fetch_screen_benchmarks(str(start.date()), str(end.date()), params["kind"],
+                                       "人民币" if params["currency"] == "人民币" else "美元")
+    cn_dates = fetch_cn_calendar(str(start.date()), str(end.date()))
+    grid, info = fixed_scan_grid(benchmarks, cn_dates, params)
+    meta = {**signature, "info": info, "grid": {n: pack_series(grid[n]) for n in BENCHMARKS},
+            "catalog": catalog.loc[catalog["基金代码"].isin(codes)].to_dict("records"),
+            "created_at": datetime.now(timezone.utc).isoformat()}
+    db = open_scan_db(job_id)
+    db.execute("INSERT INTO meta VALUES ('job',?)", (json.dumps(meta, ensure_ascii=False),))
+    db.commit(); db.close()
+    return job_id, meta
+
+
+def run_persistent_scan(job_id, workers=6, progress=None):
+    owner = scan_lease()
+    db = open_scan_db(job_id)
+    executor = None
+    started = time.perf_counter()
+    try:
+        row = db.execute("SELECT value FROM meta WHERE key='job'").fetchone()
+        if not row: raise ValueError("检查点缺少扫描设置。")
+        meta = json.loads(row[0]); codes = meta["codes"]
+        state = read_fund_state()
+        state["pending"] = job_id
+        atomic_json(FUND_STORE / "state.json", state)
+        outcomes = {c: json.loads(p) for c,p in db.execute("SELECT code,payload FROM outcomes")}
+        pending = [c for c in codes if outcomes.get(c, {}).get("status") not in ("ok", "excluded")]
+        done = len(codes) - len(pending); resumed = done; processed = 0
+        grid = pd.DataFrame({name: unpack_series(p) for name,p in meta["grid"].items()})
+        workers = max(1, min(12, int(workers)))
+        executor = ThreadPoolExecutor(max_workers=workers)
+        iterator = iter(pending); jobs = {}
+        def submit_one():
+            code = next(iterator, None)
+            if code: jobs[executor.submit(_scan_one, code, grid, meta["params"]["bonus"])] = code
+        for _ in range(workers): submit_one()
+        if progress: progress(done, len(codes), 0, None)
+        while jobs:
+            finished, _ = wait(jobs, timeout=1, return_when=FIRST_COMPLETED)
+            scan_lease(owner)
+            for future in finished:
+                code = jobs.pop(future)
+                payload = future.result()
+                outcomes[code] = payload
+                db.execute("INSERT OR REPLACE INTO outcomes VALUES (?,?)", (code, json.dumps(payload, ensure_ascii=False, allow_nan=False)))
+                db.commit()  # Each completed fund survives reruns/restarts.
+                done += 1; processed += 1
+                elapsed = time.perf_counter() - started
+                eta = (len(codes) - done) * elapsed / processed
+                if progress: progress(done, len(codes), elapsed, eta)
+                submit_one()
+        rows = []; errors = []; paths = {n: pack_series(grid[n]/grid[n].iloc[0]) for n in BENCHMARKS}
+        for code in codes:
+            item = outcomes[code]
+            if item["status"] == "ok": rows.extend(item["rows"])
+            else: errors.append({"基金代码": code, "原因": item["reason"], "状态": item["status"]})
+        ranking = pd.DataFrame(rows)
+        failed = sum(o["status"] == "retry" for o in outcomes.values())
+        if ranking.empty or failed > max(3, .2 * len(codes)):
+            raise ValueError(f"有效结果不足或下载失败过多（{failed}/{len(codes)}）；进度已保存，旧榜保留，可继续/重试。")
+        if meta["mode"] == "full":
+            pools = {name: benchmark_ranking(ranking, name, meta["params"]["pool_min_corr"]).head(50)["基金代码"].tolist() for name in BENCHMARKS}
         else:
+            pools = meta["pools"]  # Keep all original members even if temporarily excluded/under threshold.
+        union = set(c for pool in pools.values() for c in pool)
+        for code in union:
+            if outcomes.get(code, {}).get("status") == "ok": paths[code] = outcomes[code]["path"]
+        now = datetime.now(timezone.utc).isoformat()
+        snapshot = {"schema": SCAN_SCHEMA, "job_id": job_id, "computed_at": now, "mode": meta["mode"],
+                    "params": meta["params"], "info": meta["info"], "catalog": meta["catalog"],
+                    "ranking": rows, "errors": errors, "paths": paths, "pools": pools,
+                    "coverage": {"total": len(codes), "valid": sum(o["status"] == "ok" for o in outcomes.values()),
+                                 "excluded": sum(o["status"] == "excluded" for o in outcomes.values()),
+                                 "failed": failed, "resumed": resumed, "processed": processed,
+                                 "elapsed_seconds": time.perf_counter() - started}}
+        atomic_json(FUND_STORE / f"result_{job_id}.json", snapshot)
+        state = read_fund_state()
+        state.update({"latest": job_id, "pending": None})
+        if meta["mode"] == "full": state.update({"full": job_id, "full_at": now})
+        atomic_json(FUND_STORE / "state.json", state)
+        return snapshot
+    finally:
+        if executor: executor.shutdown(wait=True, cancel_futures=True)
+        db.close()
+        release_scan_lease(owner)
+
+
+def load_fund_snapshot(job_id):
+    if not job_id: return None
+    if not re.fullmatch(r"[0-9a-f]{24}", job_id): raise ValueError("无效扫描标识")
+    return json.loads((FUND_STORE / f"result_{job_id}.json").read_text(encoding="utf-8"))
+
+
+def fund_backup_bytes(state):
+    documents = {"state.json": state}
+    for job_id in {state.get("full"), state.get("latest")} - {None}:
+        documents[f"result_{job_id}.json"] = load_fund_snapshot(job_id)
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in documents.items():
+            z.writestr(name, json.dumps(data, ensure_ascii=False, allow_nan=False))
+    return buf.getvalue()
+
+
+def restore_fund_backup(content):
+    # Only JSON; no pickle, arbitrary extraction paths, or uploaded SQLite execution.
+    with zipfile.ZipFile(BytesIO(content)) as z:
+        if len(z.infolist()) > 3 or len(set(z.namelist())) != len(z.namelist()) or sum(i.file_size for i in z.infolist()) > 80_000_000:
+            raise ValueError("基金备份大小或文件数量不符。")
+        state = json.loads(z.read("state.json"))
+        identifiers = {state.get("full"), state.get("latest")} - {None}
+        if any(not re.fullmatch(r"[0-9a-f]{24}", str(i)) for i in identifiers): raise ValueError("无效快照编号")
+        expected = {"state.json"} | {f"result_{i}.json" for i in identifiers}
+        if set(z.namelist()) != expected: raise ValueError("基金备份内容不符")
+        snapshots = {i: json.loads(z.read(f"result_{i}.json")) for i in identifiers}
+    if not state.get("full") or not state.get("latest"): raise ValueError("缺少完整候选池快照")
+    for job_id, snap in snapshots.items():
+        if snap.get("schema") != SCAN_SCHEMA or snap.get("job_id") != job_id: raise ValueError("基金备份版本或标识不符")
+        if set(snap["pools"]) != set(BENCHMARKS): raise ValueError("备份缺少三个独立候选池")
+        for pool in snap["pools"].values():
+            if len(pool) > 50 or len(set(pool)) != len(pool) or any(not re.fullmatch(r"\d{6}", c) for c in pool):
+                raise ValueError("候选代码或数量不符")
+        for path in snap["paths"].values(): unpack_series(path)
+        frame = pd.DataFrame(snap["ranking"])
+        if frame.empty or not {"基金代码", "比较基准", "综合得分", "收益相关系数"}.issubset(frame.columns):
+            raise ValueError("备份评分字段不符")
+        if not set(frame["比较基准"]).issubset(BENCHMARKS) or frame.duplicated(["基金代码", "比较基准"]).any():
+            raise ValueError("备份评分基准或唯一性不符")
+    owner = scan_lease()
+    try:
+        for job_id,snap in snapshots.items(): atomic_json(FUND_STORE / f"result_{job_id}.json", snap)
+        state["pending"] = None
+        # Imported files never authorize an automatic network job on this server.
+        state["auto"] = False
+        atomic_json(FUND_STORE / "state.json", state)
+    finally: release_scan_lease(owner)
+
+
+def next_full_due(state):
+    if not state.get("full_at"): return True
+    return pd.Timestamp.now(tz="UTC") >= pd.Timestamp(state["full_at"]) + pd.DateOffset(months=1)
+
+
+def render_saved_fund_result(snapshot):
+    params = snapshot["params"]; cov = snapshot["coverage"]; info = snapshot["info"]
+    saved_time = pd.Timestamp(snapshot["computed_at"]).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S") + "（北京时间）"
+    st.caption(f"已保存：{saved_time} · {'全量扫描' if snapshot['mode']=='full' else '月度候选池刷新'}。"
+               f"处理 {cov['total']:,}，有效 {cov['valid']:,}，数据不符 {cov['excluded']:,}，获取失败 {cov['failed']:,}。")
+    st.caption(f"统一比较 {info['实际开始']} 至 {info['实际结束']}，{info['共同收益区间数']} 个收益区间；"
+               f"{params['kind']} / {params['currency']} / 时滞 {params['lag']}。保留 {params['publication_buffer']} 个美股交易日作为净值公布缓冲。")
+    st.caption("日期由基准与境内交易日历预先固定，缺少其中任意采样日的基金单独排除。"
+               "不会因为加入异常基金改变其他基金的评分日期；节假日收益按实际间隔累计。")
+    if cov["failed"]: st.warning(f"有 {cov['failed']} 个份额获取失败；当前排名不涵盖这些份额，可继续/重试最近扫描。")
+    if snapshot["errors"]:
+        with st.expander("未参与评分的基金及原因"):
+            errors = pd.DataFrame(snapshot["errors"])
+            st.dataframe(errors, hide_index=True, width="stretch")
+            st.download_button("下载排除及失败清单", errors.to_csv(index=False).encode("utf-8-sig"), "fund_errors.csv")
+    catalog = pd.DataFrame(snapshot["catalog"])
+    ranking = pd.DataFrame(snapshot["ranking"]).merge(catalog, on="基金代码", how="left", validate="many_to_one")
+    ranking["基金类别"] = np.where(ranking["基金类型"].str.startswith("QDII", na=False), "主动 QDII", "境内股票/混合（非QDII）")
+    result = {"paths": {n: unpack_series(p) for n,p in snapshot["paths"].items()}, "info": info,
+              "computed_at": snapshot["computed_at"]}
+    st.markdown("### 三个独立的月度候选池（每榜最多50个份额）")
+    st.caption(f"入池相关系数门槛 {params['pool_min_corr']:.2f}；不足50个合格份额时不凑数。"
+               "刷新仅重新排列本榜原有成员，月底全量扫描再纳入新机会。A/C份额分别计分。")
+    tabs = st.tabs([f"{n}相似基金" for n in BENCHMARKS])
+    for tab,name in zip(tabs, BENCHMARKS):
+        with tab:
+            board_rows = ranking.loc[(ranking["比较基准"] == name) & ranking["基金代码"].isin(snapshot["pools"][name])]
+            if board_rows.empty:
+                st.info("本榜暂无满足条件且数据完整的候选。下次全量扫描会重新筛选。")
+            else: render_benchmark_board(board_rows, name, result, catalog, params["kind"], params["currency"])
+    with st.expander("评分方法及全量结果"):
+        st.markdown("各指数独立评分：相似度满分100，其中55%收益相关性、25%累计路径接近度、20%最终收益接近度。"
+                    "后两项使用10个百分点衰减尺度；负相关不加分。总超额为正、相关性≥0.6、至少3个完整20区间分段且多数跑赢，"
+                    f"才按幅度及持续性加分（上限{params['bonus']:g}）。不合成三个指数。")
+        st.caption("基金按公布增长率复利计算，未扣个人申赎费。ETF收益代理包含费用与复权调整；价格指数不含分红。"
+                   "人民币基准使用USD/CNY市场汇率；日期为事后对齐，不代表可提前交易。"
+                   "境内类别不保证持仓全部为A股，当前存续目录存在存续偏差，历史相似不等于未来收益保证。"
+                   "公开候选目录不等于支付宝在售清单，额度需自行确认。")
+        export = ranking.copy()
+        for key in ["实际开始", "实际结束", "共同收益区间数"]: export[key] = info[key]
+        export["口径"] = params["kind"]; export["币种"] = params["currency"]
+        export["扫描类型"] = snapshot["mode"]; export["计算时间"] = snapshot["computed_at"]
+        st.download_button("下载本次全部评分 CSV", export.to_csv(index=False).encode("utf-8-sig"), "fund_all_scores.csv")
+        st.markdown("[天天基金公开净值](https://fund.eastmoney.com/) · [Yahoo Finance](https://finance.yahoo.com/) · "
+                    "[SOXQ指数收益代理](https://www.invesco.com/us/en/financial-products/etfs/invesco-phlx-semiconductor-etf.html)")
+
+
+def render_fund_screener():
+    st.subheader("主动基金 · 月度全量扫描与三个独立候选池")
+    if st.session_state.pop("fund_scan_saved_notice", False):
+        st.success("已保存。下次打开网页直接读取榜单；全量扫描进度也已保留。")
+    st.caption("境内主动股票/混合 + 主动QDII，不按名称或持仓地区预选。每月全面发现候选，平时仅刷新三个前50的去重并集（最多150个份额）。")
+    try:
+        state = read_fund_state()
+        snapshot = load_fund_snapshot(state.get("latest"))
+    except Exception as exc:
+        st.error(f"保存结果读取失败，请从基金榜单ZIP恢复：{exc}"); state = {}; snapshot = None
+    with st.expander("保存与恢复"):
+        st.caption("扫描检查点与榜单保存在运行服务器的 fund_data 目录。Streamlit Cloud休眠/重建后不保证本地文件保留，"
+                   "请下载基金榜单备份；它包含月度候选池、已完成评分及最近结果，不包含未完成扫描的检查点。")
+        if snapshot:
+            st.download_button("下载基金榜单与候选池备份 ZIP", fund_backup_bytes(state), "fund_screen_backup.zip", "application/zip")
+        upload = st.file_uploader("恢复基金榜单备份（与泡沫指数行情ZIP不同）", type=["zip"], key="fund_restore")
+        if upload is not None and st.button("恢复该基金榜单备份"):
             try:
-                end=end_date+pd.Timedelta(days=1)
-                begin=end-pd.Timedelta(days=int(lookback*1.9)+90)
-                with st.spinner("获取指数与汇率…"):
-                    benchmarks=fetch_screen_benchmarks(str(begin),str(end),kind,"人民币" if currency=="人民币" else "美元")
-                navs={}; failures=[]
-                bar=st.progress(0.0,text="获取基金净值…")
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    jobs={executor.submit(fetch_fund_nav,c):c for c in included}
-                    for i,job in enumerate(as_completed(jobs),1):
-                        code=jobs[job]
-                        try: navs[code]=job.result()
-                        except Exception as exc: failures.append({"基金代码":code,"原因":f"净值获取失败：{exc}"})
-                        bar.progress(i/len(jobs),text=f"已处理 {i}/{len(jobs)} 个份额")
-                ranking,paths,errors,info=compare_funds(navs,benchmarks,lookback,bonus,lag)
-                errors=pd.concat([errors,pd.DataFrame(failures)],ignore_index=True)
-                st.session_state["fund_screen_result"]={"signature":signature,"ranking":ranking,"paths":paths,"errors":errors,"info":info,
-                    "computed_at":pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),"kind":kind,"currency":currency,"bonus":bonus}
-            except Exception as exc: st.error(f"筛选未完成：{exc}")
-    result=st.session_state.get("fund_screen_result")
-    if not result: return
-    if result["signature"]!=signature:
-        st.info("候选或计算参数已变化，请重新计算；不展示旧参数下的排名。")
-        return
-    ranking=result["ranking"]
-    if not result["errors"].empty:
-        with st.expander("未参与评分的基金及原因",expanded=ranking.empty):
-            st.dataframe(result["errors"],hide_index=True,width="stretch")
-    if ranking.empty:
-        st.warning("没有符合数据要求的评分结果。")
-        return
-    info=result["info"]
-    st.caption(f"请求 {info['请求开始']} 至 {info['请求结束']}；共同有效日期 {info['实际开始']} 至 {info['实际结束']}，"
-               f"共 {info['共同收益区间数']} 个收益区间。所有基金与基准使用相同日期，长假期间收益按实际间隔累计。")
-    st.caption("计算时间："+result["computed_at"]+"；这是当前候选集合的历史描述性排名，不是全市场排名或未来收益预测。")
-    ranking=ranking.merge(catalog,on="基金代码",how="left",validate="many_to_one")
-    ranking["基金类别"]=np.where(ranking["基金类型"].str.startswith("QDII",na=False),"主动 QDII","境内股票/混合（非QDII）")
-    st.markdown("### 三个独立相似度榜单")
-    st.caption("分别评分、分别排名，不合成三个指数。一只基金若同时接近多个指数，可以出现在多个榜单；"
-               "各榜的相关性门槛、叠加曲线和下载文件独立。")
-    st.caption("基金类别按公开分类标记，非QDII不等于已核验全部持仓均为A股。"
-               "历史相似是研究线索，不代表未来始终同步或已确认存在超额收益机会。")
-    board_names = list(BENCHMARKS)
-    board_tabs = st.tabs([f"{name}相似基金" for name in board_names])
-    for board_tab, chosen in zip(board_tabs, board_names):
-        with board_tab:
-            render_benchmark_board(ranking, chosen, result, catalog, kind, currency)
-    with st.expander("评分方法与数据来源"):
-        st.markdown("相似度满分 **100**：55% 收益相关性＋25% 累计路径接近度＋20% 最终收益接近度。"
-                    "路径与最终收益差按 10 个百分点尺度指数衰减，负相关不加相关性分。")
-        st.markdown(f"每个指数独立计算稳定超额，最多加 **{bonus:g}** 分：总超额为正、相关系数至少 0.6，且至少三个互不重叠的 "
-                    "20 区间分段中，超过一半跑赢，才按超额幅度和持续性加分。综合得分可超过 100；分数不是成功概率。")
-        st.caption("基金使用公布的日增长率复利连乘，避免把未复权单位净值或累计净值比值误当总收益。"
-                   "未扣个人申购赎回费。回撤按共同采样日期估计，可能低估日期间回撤。"
-                   "币种、净值日期解释和固定时滞需结合基金估值说明核对；未搜索最优时滞。"
-                   "候选来自当前存续目录，存在存续偏差；稳定超额不是风险调整后的 Alpha。")
-        st.markdown("[天天基金公开目录](https://fund.eastmoney.com/) · "
-                    "[Yahoo Finance](https://finance.yahoo.com/) · "
-                    "[QQQ](https://www.invesco.com/qqq-etf/en/home.html) · "
-                    "[SOXQ](https://www.invesco.com/us/en/financial-products/etfs/invesco-phlx-semiconductor-etf.html) · "
-                    "[SPY](https://www.ssga.com/us/en/individual/etfs/state-street-spdr-sp-500-etf-trust-spy)")
+                restore_fund_backup(upload.getvalue())
+                for key in ("fund_lookback", "fund_bonus", "fund_kind", "fund_currency", "fund_lag",
+                            "fund_buffer", "fund_pool_corr", "fund_auto"):
+                    st.session_state.pop(key, None)
+                st.rerun()
+            except Exception as exc: st.error(f"恢复失败：{exc}")
+    initial = {**SCAN_DEFAULTS, **(snapshot or {}).get("params", {})}
+    with st.expander("全量扫描设置（修改后需重新全量扫描）", expanded=snapshot is None):
+        c1,c2,c3 = st.columns(3)
+        lookback = int(c1.number_input("回看美股交易日数", 60, 1500, int(initial["lookback"]), key="fund_lookback"))
+        bonus = float(c2.number_input("稳定超额最高加分", 0.0, 50.0, float(initial["bonus"]), key="fund_bonus"))
+        workers = int(c3.number_input("并发下载数", 1, 12, 6, key="fund_workers"))
+        c1,c2,c3 = st.columns(3)
+        kinds = ["ETF复权收益代理", "原始价格指数"]
+        currencies = ["人民币", "美元指数对人民币基金（未校正）"]
+        kind = c1.selectbox("比较口径", kinds, index=kinds.index(initial["kind"]), key="fund_kind")
+        currency = c2.selectbox("比较币种", currencies, index=currencies.index(initial["currency"]), key="fund_currency")
+        lag = c3.selectbox("基金日期对应美股日期", [0,1], index=int(initial["lag"]), format_func=lambda x: "同一日期（事后比较）" if x==0 else "前一个美股交易日", key="fund_lag")
+        c1,c2 = st.columns(2)
+        buffer = int(c1.number_input("净值公布缓冲（美股交易日）", 0, 10, int(initial["publication_buffer"]), key="fund_buffer"))
+        mincorr = float(c2.number_input("月度候选入池最低相关系数", 0.0, 1.0, float(initial["pool_min_corr"]), step=.05, key="fund_pool_corr"))
+        st.caption("并发主要缩短网络等待，不是按CPU核数强行增加连接。默认6路；遇到限流可降低。"
+                   "缓冲期用于等待净值公布，榜单展示的是实际净值日期，不是盘中估值。")
+    settings = {"lookback": lookback, "bonus": bonus, "workers": workers, "kind": kind, "currency": currency,
+                "lag": lag, "publication_buffer": buffer, "pool_min_corr": mincorr, "auto": True}
+    params_changed = snapshot is not None and any(settings[k] != snapshot["params"][k] for k in snapshot["params"])
+    if params_changed: st.info("设置已变化；下面仍是标明原参数的已保存榜单，候选刷新沿用原口径，新设置需全量扫描后生效。")
+    auto = st.checkbox("到期后自动更新：全量每月一次，候选每小时最多刷新一次", value=state.get("auto", True), key="fund_auto")
+    st.caption("在打开或操作网页时检查是否到期；网页关闭/服务器休眠时不运行后台定时任务。每小时刷新仅获取最新已公布日净值。")
+    if auto != state.get("auto"):
+        state["auto"] = auto; atomic_json(FUND_STORE / "state.json", state)
+    c1,c2,c3 = st.columns(3)
+    full_clicked = c1.button("全量扫描 / 重新选前50", type="primary", key="run_fund_full")
+    update_clicked = c2.button("立即刷新候选净值与排名", disabled=snapshot is None, key="run_fund_update")
+    resume_id = state.get("pending") or (snapshot or {}).get("job_id")
+    can_resume = bool(resume_id and (state.get("pending") or (snapshot or {}).get("coverage", {}).get("failed")) and (FUND_STORE / f"scan_{resume_id}.sqlite").exists())
+    resume_clicked = c3.button("继续 / 重试最近扫描", disabled=not can_resume, key="resume_fund_scan")
+    if state.get("pending"): st.info("存在未完成的扫描；点击继续会复用已完成记录，不重新下载全部基金。")
+    if state.get("full_at"):
+        due = pd.Timestamp(state["full_at"]) + pd.DateOffset(months=1)
+        st.caption(f"下次全量扫描到期：{due.strftime('%Y-%m-%d')}；候选池刷新不会推迟该日期。")
+    automatic = None
+    if auto and snapshot and not params_changed and not state.get("pending"):
+        age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(snapshot["computed_at"])
+        attempted = pd.Timestamp(state.get("last_attempt", "2000-01-01T00:00:00Z"))
+        if (pd.Timestamp.now(tz="UTC") - attempted).total_seconds() >= 3600:
+            if next_full_due(state): automatic = "full"
+            elif age.total_seconds() >= 3600: automatic = "update"
+    mode = "full" if full_clicked else "update" if update_clicked else automatic
+    progress_slot = st.empty()
+    # Paint the saved result before a slow network job, keeping the old board visible.
+    if snapshot: render_saved_fund_result(snapshot)
+    if mode or resume_clicked:
+        try:
+            state["last_attempt"] = datetime.now(timezone.utc).isoformat()
+            atomic_json(FUND_STORE / "state.json", state)
+            if resume_clicked:
+                job_id = resume_id
+            else:
+                with st.spinner("准备目录、统一基准日期和检查点…"):
+                    catalog = fetch_fund_catalog() if mode == "full" else pd.DataFrame(load_fund_snapshot(state["full"])["catalog"])
+                    use_settings = settings if mode == "full" else {**settings, **snapshot["params"]}
+                    previous = load_fund_snapshot(state.get("full"))
+                    job_id,_ = prepare_scan(catalog, use_settings, mode, pd.Timestamp.now(tz="Asia/Shanghai").date(), previous,
+                                            nonce=state["last_attempt"])
+            bar = progress_slot.progress(0.0, text="读取已保存的扫描进度…")
+            def progress(done, total, elapsed, eta):
+                text = f"已处理 {done:,}/{total:,}；本轮已用 {elapsed/60:.1f} 分钟"
+                if eta is not None: text += f"，按当前速度预计剩余 {eta/60:.1f} 分钟"
+                bar.progress(done / total, text=text)
+            snapshot = run_persistent_scan(job_id, workers, progress)
+            st.session_state["fund_scan_saved_notice"] = True
+            st.rerun()
+        except Exception as exc:
+            st.error(f"扫描未完成：{exc}。已保存的旧榜继续可用。")
+    if not snapshot: st.info("首次点击全量扫描。扫描会自动遍历整个主动基金目录，不再限制每次300个；完成后显示并保存三个榜单。")
+
 
 
 C_BG       = "#131722"
@@ -1009,7 +1325,7 @@ def dark_layout(height=520, y_range=None, y_title=None, title_text=None):
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="AI泡沫指数 V3.2.2", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="AI泡沫指数 V3.3", page_icon="📈", layout="wide")
     
     # ============================================================
     # Bloomberg / TradingView 深色主题 CSS
@@ -1018,6 +1334,12 @@ if __name__ == "__main__":
     <style>
     /* 主背景 */
     .stApp { background-color: #131722; color: #d1d4dc; }
+    [data-testid="stHeader"] { background-color: #131722; }
+    button[kind="secondary"], [data-testid="stFileUploaderDropzone"],
+    [data-testid="stNumberInputContainer"], [data-testid="stNumberInputContainer"] button,
+    input, textarea { background-color: #1e222d !important; color: #d1d4dc !important; }
+    button[kind="secondary"] { border-color: #4a4e59 !important; }
+    button:disabled { opacity: 0.5; }
     
     /* 侧边栏 */
     section[data-testid="stSidebar"] {
