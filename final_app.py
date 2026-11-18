@@ -22,7 +22,8 @@ USER_CONFIG = {
     "TOTAL_SMOOTH_DAYS": 5,  # V4 总分的单次简单平均天数（约一周，对应美投按周更新）；0 为不平滑
     "START_DATE": "1960-01-01",
     "BIAS_POINTS": 15.0,  # 旧版 V3.3.2 的人工风险修正（用户手动调定，旧版保留）
-    "V4_BIAS_POINTS": 0.0,  # V4 人工修正：评级区间已按历史底部/顶部读数重新划定，故不再加 +15
+    "V4_BIAS_POINTS": 0.0,
+    "UP_RED": True,  # 涨跌配色：True 红涨绿跌（中文习惯）；False 绿涨红跌  # V4 人工修正：评级区间已按历史底部/顶部读数重新划定，故不再加 +15
     "CACHE_SECONDS": 300,
     "P6_METHOD": "smooth",  # smooth 连续版；legacy 原版阶梯
     "P6_TRANSITION_WIDTH": 0.02,  # 与 ^TNX 输入同单位；不根据近期走势自动调参
@@ -630,11 +631,17 @@ def period_text(values):
 def plot_index(frame, show_legacy=False, zones=None):
     zones = zones or ZONES
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    for lo, hi, _, color in zones:
-        fig.add_hrect(y0=lo, y1=min(hi, 100), fillcolor=color, opacity=.045,
+    for lo, hi, label, color in zones:
+        fig.add_hrect(y0=lo, y1=min(hi, 100), fillcolor=color, opacity=.06,
                       line_width=0, layer="below", secondary_y=False)
-    fig.add_trace(go.Scatter(x=frame.index, y=frame.QQQ, name="QQQ",
-        line=dict(color="rgba(209,212,220,.25)", width=1.2),
+        if zones is not ZONES:
+            name = label.split(" ", 1)[1].split(" (")[0] if " " in label else label
+            fig.add_annotation(x=0.004, xref="paper", xanchor="left", y=(lo + min(hi, 100)) / 2, yref="y",
+                               text=name, showarrow=False, font=dict(size=11, color=color), opacity=.8,
+                               bgcolor="rgba(10,13,19,.55)", borderpad=2)
+    q = frame.QQQ.dropna()
+    fig.add_trace(go.Scatter(x=frame.index, y=frame.QQQ, name="QQQ（右轴）", fill="tozeroy",
+        fillcolor="rgba(120,140,170,.07)", line=dict(color="rgba(180,192,212,.38)", width=1.1),
         hovertemplate="QQQ: $%{y:.2f}<extra></extra>"), secondary_y=True)
     # Mask traces without dropping rows so unavailable periods are never connected.
     colors = pd.Series([index_color(v,r,zones) for v,r in zip(frame["完整指数"], frame.QQQ_1w_ret)], index=frame.index)
@@ -657,23 +664,28 @@ def plot_index(frame, show_legacy=False, zones=None):
             name="旧版对照", mode="lines", connectgaps=False,
             line=dict(color="#FF9F0A", width=1.6, dash="dash"),
             hovertemplate="旧版指数: %{y:.2f}<extra></extra>"), secondary_y=False)
-    layout = dark_layout(height=530)
-    layout.update(showlegend=True, legend=dict(orientation="h", y=1.12, x=0))
+    layout = dark_layout(height=540)
+    layout.update(showlegend=True, legend=dict(orientation="h", y=1.08, x=0, font=dict(size=12, color=C_MUTED)))
     fig.update_layout(**layout)
-    fig.update_yaxes(range=[0,100], title_text="泡沫指数 / 早期参考", secondary_y=False)
-    fig.update_yaxes(title_text="QQQ 复权价格", showgrid=False, secondary_y=True)
+    fig.update_yaxes(range=[0,100], title_text="泡沫指数", secondary_y=False)
+    if len(q):
+        pad = (q.max() - q.min()) * .08
+        fig.update_yaxes(range=[q.min() - pad, q.max() + pad], secondary_y=True)
+    fig.update_yaxes(title_text="QQQ 复权价格", showgrid=False, secondary_y=True,
+                     tickfont=dict(color=C_MUTED, size=11, family="JetBrains Mono, Consolas, monospace"))
     return fig
 
 
 def render_main(section="综合指数看板"):
-    st.markdown('<div class="app-title">AI 泡沫综合指数 <span>私人量化终端 · 自有模型</span></div>', unsafe_allow_html=True)
+    page_header(section, {"综合指数看板": "AI 泡沫综合指数 · 七项指标实时合成", "历史回测分析": "按评级区间统计 QQQ 后续收益",
+                          "数据与备份": "数据覆盖、逐日明细、备份与网络诊断"}.get(section, ""))
     st.sidebar.header("⚙️ 看板控制台")
     model = st.sidebar.radio("模型版本", ["v4", "legacy"],
         index=0 if USER_CONFIG["MODEL"] == "v4" else 1,
         format_func=lambda value: "V4 资金面重建（FRED，7项等权）" if value == "v4" else "旧版 V3.3.2（HYG/IEF + 收益率动量）",
         key="model_version_v4")
     method = USER_CONFIG["P6_METHOD"]
-    show_legacy = st.sidebar.checkbox("叠加旧版曲线对照", value=True,
+    show_legacy = st.sidebar.checkbox("叠加旧版曲线对照", value=False,
                                       key="capital_comparison_v332")
     fred_upload = None
     if model == "v4":
@@ -707,16 +719,15 @@ def render_main(section="综合指数看板"):
                     raw, name = saved
                 source_label = "下载失败后的备份回退（非在线更新成功）"
                 st.warning(f"在线获取失败，正在使用本地备份 {name}。原因：{exc}")
-        render_market_status(raw, source_label)
+        stale = (pd.Timestamp.now(tz="America/New_York").date() - raw.index[-1].date()).days > 7
+        chips = [market_chip(raw, source_label)]
         legacy_df = calculate_indices(raw, p6_method=method)
         fred = None
         if model == "v4":
             with st.spinner("正在获取 FRED 资金面数据…"):
                 fred, fred_label, fred_note = load_fred_inputs(fred_upload)
             fred_last = fred_last_date(fred)
-            st.caption(f"资金面数据来源：{fred_label} · FRED 截至 {fred_last:%Y-%m-%d}（周度，按发布滞后{FRED_RELEASE_LAG_DAYS}天生效）")
-            if fred_note:
-                st.warning(fred_note)
+            chips.append(("资金面", f"{fred_label} · 截至 {fred_last:%Y-%m-%d}", "ok" if fred_label.startswith("FRED在线") else "warn"))
             df = calculate_indices_v4(raw, fred)
             st.session_state["_capital_weekly"] = capital_factors(fred, df.index)[1]
         else:
@@ -726,6 +737,14 @@ def render_main(section="综合指数看板"):
         df["旧版P6"] = legacy_df["P6"]
         df["指数变化（当前减旧版）"] = df["总泡沫指数"] - df["旧版总泡沫指数"]
         factor_names = NEW_FACTOR_NAMES if model == "v4" else FACTOR_NAMES
+        chips.append(("模型", "V4 · 七项等权" if model == "v4" else "旧版 V3.3.2", "info"))
+        st.markdown(chips_html(chips), unsafe_allow_html=True)
+        if stale:
+            st.warning("行情已超过7个自然日未推进，请检查在线下载结果；当前日期不代表数据日期。")
+        if model == "v4" and fred_note:
+            st.warning(fred_note)
+        st.markdown(snapshot_tiles(raw, fred, st.session_state.get("_capital_weekly") if model == "v4" else None),
+                    unsafe_allow_html=True)
     except Exception as exc:
         st.error(str(exc))
         st.info("可在侧边栏上传以前下载的 ZIP 行情备份；下方基金筛选仍可单独使用。")
@@ -744,7 +763,7 @@ def render_main(section="综合指数看板"):
     st.sidebar.caption("时间范围只控制图表；两种百分位始终使用各自全部历史。")
 
     if stats:
-        render_hero(df, stats, zones, model)
+        render_hero(df, stats, zones, model, factor_names)
         if stats["asof"] < df.index[-1]:
             st.warning(f"最新行情至 {df.index[-1]:%Y-%m-%d}，但完整指数仅有效至 {stats['asof']:%Y-%m-%d}。"
                        "后续缺失不转为早期参考；两个百分位统一截止于该有效日期。")
@@ -764,8 +783,7 @@ def render_main(section="综合指数看板"):
             if not show_early and len(ref_df):
                 st.caption("查看更早曲线：勾选侧边栏“显示早期参考历史”，并选择“全部可用历史”或指定起止日期。")
             st.markdown("#### 构成总表")
-            st.dataframe(composition_table(df, stats, factor_names, model), hide_index=True, width="stretch",
-                         column_config=COMPOSITION_COLUMNS)
+            st.markdown(composition_html(df, stats, factor_names, model), unsafe_allow_html=True)
             st.caption(model_formula_text(model))
         for tab, module in [(tab_senti, "情绪面"), (tab_capital, "资金面")]:
             with tab:
@@ -981,17 +999,36 @@ def gauge_figure(value, zones):
     steps = [dict(range=[lo, min(hi, 100)], color=color) for lo, hi, _, color in zones]
     fig = go.Figure(go.Indicator(
         mode="gauge+number", value=value,
-        number=dict(font=dict(size=54, color=C_TEXT, family="Courier New, monospace"), valueformat=".1f"),
+        number=dict(font=dict(size=58, color=C_TEXT, family="JetBrains Mono, Consolas, monospace"), valueformat=".1f"),
         gauge=dict(axis=dict(range=[0, 100], tickwidth=1, tickcolor=C_MUTED, tickfont=dict(color=C_MUTED, size=12),
                              tickvals=sorted({lo for lo, _, _, _ in zones} | {100})),
                    bar=dict(color="rgba(255,255,255,.85)", thickness=.18),
                    bgcolor=C_PANEL, borderwidth=0, steps=steps,
                    threshold=dict(line=dict(color="#ffffff", width=4), thickness=.9, value=value))))
-    fig.update_layout(height=260, margin=dict(l=20, r=20, t=20, b=0), paper_bgcolor=C_BG, font=dict(color=C_TEXT))
+    fig.update_layout(height=232, margin=dict(l=28, r=28, t=22, b=0), paper_bgcolor="rgba(0,0,0,0)", font=dict(color=C_TEXT))
     return fig
 
 
-def render_hero(df, stats, zones, model):
+def zone_ladder_html(value, zones):
+    segs = "".join(f'<div class="seg" style="width:{min(hi, 100) - lo}%;background:{c}"></div>' for lo, hi, _, c in zones)
+    label, _ = zone_of(value, zones)
+    idx = next((i for i, z in enumerate(zones) if z[0] <= value < z[1]), None)
+    short = lambda lab: lab.split(" ", 1)[1].split(" (")[0] if " " in lab else lab
+    up = down = "—"
+    if idx is not None:
+        if idx + 1 < len(zones):
+            up = f'距「{short(zones[idx + 1][2])}」<b>+{zones[idx + 1][0] - value:.1f}</b>'
+        else:
+            up = "已在最高档"
+        down = f'距「{short(zones[idx - 1][2])}」<b>−{value - zones[idx][0]:.1f}</b>' if idx > 0 else "已在最低档"
+    ticks = "".join(f'<span style="left:{lo}%">{lo}</span>' for lo, _, _, _ in zones) + '<span style="left:100%">100</span>'
+    return (f'<div class="ladder-card"><div class="hero-label">评级区间位置</div>'
+            f'<div class="ladder">{segs}<div class="mark" style="left:{min(max(value, 0), 100):.1f}%"><b>{value:.1f}</b></div></div>'
+            f'<div class="ladder-scale">{ticks}</div>'
+            f'<div class="ladder-txt"><span>↓ {down}</span><span>{up} ↑</span></div></div>')
+
+
+def render_hero(df, stats, zones, model, factor_names=None):
     full = stats["full"]
     val = stats["value"]
     label, color = zone_of(val, zones)
@@ -1005,10 +1042,11 @@ def render_hero(df, stats, zones, model):
     left, right = st.columns([1.05, 1.4])
     with left:
         st.plotly_chart(gauge_figure(val, zones), width="stretch", config={"displayModeBar": False})
+        st.markdown(zone_ladder_html(val, zones), unsafe_allow_html=True)
     with right:
         st.markdown(
             f"""<div class="hero-card">
-              <div class="hero-label">AI 泡沫指数 · {'V4 资金面重建' if model == 'v4' else '旧版 V3.3.2'}</div>
+              <div class="hero-label">AI Bubble Index · {'V4' if model == 'v4' else 'V3.3.2'} · 当前评级</div>
               <div class="hero-zone" style="color:{color};border-color:{color}">{label}</div>
               <div class="hero-grid">
                 <div><span>一周前</span><b>{ago(7):.1f}</b></div>
@@ -1018,7 +1056,8 @@ def render_hero(df, stats, zones, model):
                 <div><span>资金面</span><b>{capital:.1f}</b></div>
                 <div><span>历史百分位</span><b>{stats['full_pct']:.0f}%</b></div>
               </div>
-              <div class="hero-foot">截至 {stats['asof']:%Y-%m-%d} · 完整期 {full.index[0]:%Y-%m-%d} 起 · 百分位为完整期全部历史中的排位</div>
+              {heat_strip(df, stats['asof'], factor_names, model, zones) if factor_names else ''}
+              <div class="hero-foot">截至 {stats['asof']:%Y-%m-%d} · 完整期 {full.index[0]:%Y-%m-%d} 起 · 百分位为完整期全部历史中的排位 · 下方色块为各分项当前分数</div>
             </div>""", unsafe_allow_html=True)
 
 
@@ -1049,6 +1088,143 @@ def composition_table(df, stats, factor_names, model):
     return pd.DataFrame(rows)
 
 
+# ============================================================
+# 终端风格界面组件（顶栏/作者、状态标签、行情快照、因子热力条、构成表）
+# 涨跌配色：USER_CONFIG["UP_RED"]=True 为红涨绿跌（中文习惯）
+# ============================================================
+AUTHOR_CN, AUTHOR_EN = "高章磊", "Gao Zhanglei"
+C_GOLD = "#E8B84A"
+
+
+def up_down_color(delta):
+    if delta is None or pd.isna(delta) or abs(delta) < 1e-12:
+        return C_MUTED
+    up = "#F0525A" if USER_CONFIG.get("UP_RED", True) else "#1FB47E"
+    down = "#1FB47E" if USER_CONFIG.get("UP_RED", True) else "#F0525A"
+    return up if delta > 0 else down
+
+
+def render_topbar():
+    now_tk = pd.Timestamp.now(tz="Asia/Tokyo")
+    now_ny = pd.Timestamp.now(tz="America/New_York")
+    st.markdown(f"""
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo">AI</div>
+        <div><div class="brand-name">AI BUBBLE MONITOR</div>
+             <div class="brand-sub">AI 泡沫指数 · 私人量化终端 · V4</div></div>
+      </div>
+      <div class="clocks">
+        <div><span>东京</span><b>{now_tk:%m-%d %H:%M}</b></div>
+        <div><span>纽约</span><b>{now_ny:%m-%d %H:%M}</b></div>
+      </div>
+      <div class="author">
+        <div class="author-text"><span>MODEL AUTHOR · 模型作者</span><b>{AUTHOR_CN}</b><em>{AUTHOR_EN}</em></div>
+        <div class="avatar">{AUTHOR_CN[0]}</div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+
+def page_header(title, subtitle=""):
+    st.markdown(f'<div class="page-head"><h2>{title}</h2><span>{subtitle}</span></div>', unsafe_allow_html=True)
+
+
+def chips_html(items):
+    """items: [(标签, 值, 状态)]，状态 ok / warn / info"""
+    out = []
+    for label, value, tone in items:
+        out.append(f'<span class="chip chip-{tone}"><i></i>{label}<b>{value}</b></span>')
+    return '<div class="chips">' + "".join(out) + "</div>"
+
+
+def market_chip(raw, source):
+    tone = "ok" if source.startswith("在线") else "warn"
+    retrieved = raw.attrs.get("retrieved_at_utc")
+    extra = ""
+    if retrieved:
+        extra = f" · 获取 {pd.Timestamp(retrieved).tz_convert('Asia/Tokyo'):%H:%M}"
+    return ("行情", f"{source} · 截至 {raw.index[-1]:%Y-%m-%d}{extra}", tone)
+
+
+def snapshot_tiles(raw, fred=None, weekly=None):
+    close = raw["Close"]
+    tiles = []
+
+    def last2(series):
+        s = series.dropna()
+        return (float(s.iloc[-1]), float(s.iloc[-2])) if len(s) > 1 else (np.nan, np.nan)
+
+    for t, name, kind in [("QQQ", "纳指100 QQQ", "pct"), ("SPY", "标普500 SPY", "pct"),
+                          ("^VIX", "VIX 波动率", "abs"), ("^TNX", "美债10年", "bp")]:
+        if t in close:
+            now, prev = last2(close[t])
+            if kind == "pct":
+                tiles.append((name, f"{now:,.2f}", (now / prev - 1) * 100, f"{(now / prev - 1) * 100:+.2f}%"))
+            elif kind == "abs":
+                tiles.append((name, f"{now:.2f}", now - prev, f"{now - prev:+.2f}"))
+            else:
+                tiles.append((name, f"{now:.2f}%", now - prev, f"{(now - prev) * 100:+.0f}bp"))
+    if fred is not None and "BAMLH0A0HYM2" in fred:
+        now, prev = last2(fred["BAMLH0A0HYM2"])
+        tiles.append(("高收益债利差", f"{now:.2f}%", now - prev, f"{(now - prev) * 100:+.0f}bp"))
+    if weekly is not None:
+        nl = weekly["净流动性(十亿美元)"].dropna()
+        nl = nl.loc[nl.index <= pd.Timestamp.now().normalize()]
+        if len(nl) > 1:
+            tiles.append(("美联储净流动性", f"${nl.iloc[-1] / 1000:.2f}T", nl.iloc[-1] - nl.iloc[-2],
+                          f"{nl.iloc[-1] - nl.iloc[-2]:+.0f}B/周"))
+        sp = weekly["联邦基金−3月国债(%)"].dropna()
+        sp = sp.loc[sp.index <= pd.Timestamp.now().normalize()]
+        if len(sp) > 1:
+            tiles.append(("联邦基金−3月国债", f"{sp.iloc[-1] * 100:+.0f}bp", sp.iloc[-1] - sp.iloc[-2],
+                          f"{(sp.iloc[-1] - sp.iloc[-2]) * 100:+.0f}bp/周"))
+    cells = "".join(
+        f'<div class="tick"><span>{n}</span><b>{v}</b><em style="color:{up_down_color(d)}">{c}</em></div>'
+        for n, v, d, c in tiles)
+    return f'<div class="ticker">{cells}</div>'
+
+
+def zone_color(value, zones):
+    return zone_of(value, zones)[1] if pd.notna(value) else C_MUTED
+
+
+def heat_strip(df, asof, factor_names, model, zones):
+    keys = module_keys(model, "情绪面") + module_keys(model, "资金面")
+    cells = []
+    for key in keys:
+        v = df.loc[asof, key]
+        col = zone_color(v, ZONES_V4)
+        name = factor_names[key].split("（")[0]
+        cells.append(f'<div class="heat" style="--c:{col}"><span>{key}</span><b>{v:.0f}</b><em>{name}</em></div>')
+    return '<div class="heatrow">' + "".join(cells) + "</div>"
+
+
+def composition_html(df, stats, factor_names, model, module=None):
+    if not stats:
+        return ""
+    table = composition_table(df, stats, factor_names, model)
+    if module:
+        table = table[table["模块"].eq(module)]
+    rows = []
+    for _, r in table.iterrows():
+        group = r["指标"].startswith("【")
+        val = r["当前"]
+        bar_col = zone_color(val, ZONES_V4)
+        d1, d2 = r["1周变化"], r["1月变化"]
+        fmt = lambda d: "—" if pd.isna(d) else f"{d:+.1f}"
+        name = f"{r['模块']}合计" if group else r["指标"]
+        rows.append(
+            f'<tr class="{"grp" if group else ""}"><td>{name}</td>'
+            f'<td><div class="bar"><div style="width:{0 if pd.isna(val) else val:.1f}%;background:{bar_col}"></div></div></td>'
+            f'<td class="num">{val:.1f}</td>'
+            f'<td class="num" style="color:{up_down_color(d1)}">{fmt(d1)}</td>'
+            f'<td class="num" style="color:{up_down_color(d2)}">{fmt(d2)}</td>'
+            f'<td class="num">{r["权重"]:.1f}%</td>'
+            f'<td class="src">{r["数据来源"]}</td><td class="src">{r["含义"]}</td></tr>')
+    head = "<tr><th>指标</th><th style='width:22%'>分数</th><th>当前</th><th>1周</th><th>1月</th><th>权重</th><th>数据来源</th><th>含义</th></tr>"
+    return f'<table class="ctable">{head}{"".join(rows)}</table>'
+
+
 def factor_chart(frame, key, title, color, height=230):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=frame.index, y=frame[key], mode="lines", connectgaps=False,
@@ -1074,15 +1250,13 @@ def render_module_tab(df, frame, stats, factor_names, model, module, show_legacy
                                  line=dict(color=C_MUTED, width=1.4, dash="dash"), connectgaps=False))
     fig.add_trace(go.Scatter(x=frame.index, y=frame.QQQ, name="QQQ（右轴）", yaxis="y2",
                              line=dict(color="rgba(209,212,220,.28)", width=1.2)))
-    layout = dark_layout(height=330, y_range=[0, 100], title_text=f"{module}合成分数")
-    layout.update(showlegend=True, legend=dict(orientation="h", y=1.14, x=0),
+    layout = dark_layout(height=340, y_range=[0, 100], title_text=f"{module}合成分数")
+    layout.update(showlegend=True, legend=dict(orientation="h", y=1.12, x=1, xanchor="right", font=dict(size=12, color=C_MUTED)),
+                  margin=dict(l=8, r=8, t=56, b=8),
                   yaxis2=dict(overlaying="y", side="right", showgrid=False, tickfont=dict(color=C_MUTED)))
     fig.update_layout(**layout)
     st.plotly_chart(fig, width="stretch")
-    sub = composition_table(df, stats, factor_names, model)
-    if not sub.empty:
-        st.dataframe(sub[sub["模块"].eq(module)].drop(columns=["模块"]), hide_index=True, width="stretch",
-                     column_config=COMPOSITION_COLUMNS)
+    st.markdown(composition_html(df, stats, factor_names, model, module), unsafe_allow_html=True)
     palette = ["#4DABF7", "#9775FA", "#F783AC", "#63E6BE"]
     cols = st.columns(2)
     for i, key in enumerate(keys):
@@ -1979,12 +2153,12 @@ def render_fund_screener():
 
 
 
-C_BG       = "#131722"
-C_PANEL    = "#1e222d"
-C_BORDER   = "#2a2e39"
-C_BLUE     = "#2962ff"
-C_TEXT     = "#d1d4dc"
-C_MUTED    = "#787b86"
+C_BG       = "#0A0D13"
+C_PANEL    = "#10151E"
+C_BORDER   = "#1C2433"
+C_BLUE     = "#3D7BFF"
+C_TEXT     = "#E6E9EF"
+C_MUTED    = "#8A93A3"
 
 ZONES = [
     (0,   33,  "💎 极限大底/重仓 (<33)",  "#00FFFF"), 
@@ -2002,22 +2176,24 @@ def dark_layout(height=520, y_range=None, y_title=None, title_text=None):
     """返回统一的深色 Plotly 布局字典"""
     layout = dict(
         height=height,
-        paper_bgcolor=C_BG,
+        paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor=C_PANEL,
-        font=dict(color=C_TEXT, family="Courier New, monospace", size=15),
-        margin=dict(l=8, r=8, t=30 if title_text else 10, b=8),
+        font=dict(color=C_TEXT, family="Inter, PingFang SC, Microsoft YaHei, sans-serif", size=13),
+        margin=dict(l=8, r=8, t=36 if title_text else 10, b=8),
         hovermode="x unified",
-        hoverlabel=dict(font_size=15, font_family="Courier New, monospace"),
+        hoverlabel=dict(font_size=13, font_family="JetBrains Mono, Consolas, monospace", bgcolor="#151B26", bordercolor="#2a3346"),
         showlegend=False,
-        xaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
-        yaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, tickfont=dict(color=C_MUTED, size=14)),
+        xaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, zeroline=False,
+                   tickfont=dict(color=C_MUTED, size=12, family="JetBrains Mono, Consolas, monospace")),
+        yaxis=dict(gridcolor=C_BORDER, linecolor=C_BORDER, showgrid=True, zeroline=False,
+                   tickfont=dict(color=C_MUTED, size=12, family="JetBrains Mono, Consolas, monospace")),
     )
     if y_range:
         layout["yaxis"]["range"] = y_range
     if y_title:
         layout["yaxis"]["title"] = dict(text=y_title, font=dict(color=C_MUTED, size=15))
     if title_text:
-        layout["title"] = dict(text=title_text, font=dict(color=C_TEXT, size=16), x=0, xanchor="left")
+        layout["title"] = dict(text=title_text, font=dict(color="#C9CED8", size=14), x=0, xanchor="left")
     return layout
 
 
@@ -2061,11 +2237,7 @@ def refresh_online_market():
 
 
 def render_market_status(raw, source):
-    st.caption(f'当前数据来源：{source} · 行情截止 {raw.index[-1]:%Y-%m-%d}（纽约交易日）')
-    retrieved = raw.attrs.get('retrieved_at_utc')
-    if retrieved:
-        stamp = pd.Timestamp(retrieved).tz_convert('Asia/Tokyo')
-        st.caption(f'本次响应获取时间：{stamp:%Y-%m-%d %H:%M:%S} 日本时间；行情缓存最多5分钟。')
+    st.markdown(chips_html([market_chip(raw, source)]), unsafe_allow_html=True)
     if (pd.Timestamp.now(tz='America/New_York').date() - raw.index[-1].date()).days > 7:
         st.warning('行情已超过7个自然日未推进，请检查在线下载结果；当前日期不代表数据日期。')
 
@@ -2384,7 +2556,12 @@ def window_returns(frame):
             row["基金年化%"] = ((1 + f) ** (365 / days) - 1) * 100
             row["基准年化%"] = ((1 + b) ** (365 / days) - 1) * 100
         rows.append(row)
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    for col in out.columns:
+        if col not in ("区间", "起始日"):
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out["起始日"] = out["起始日"].fillna("—")
+    return out
 
 
 def rolling_average(frame):
@@ -2417,8 +2594,7 @@ def risk_stats(frame, weeks):
 
 
 def render_holdings():
-    st.markdown('<div class="app-title">持仓基金对比 <span>QDII 基金 vs 对应美股基准 · 人民币口径</span></div>',
-                unsafe_allow_html=True)
+    page_header("持仓基金对比", "QDII 基金 vs 对应美股基准 · 人民币口径")
     st.sidebar.header("⚙️ 基金对比设置")
     lag = st.sidebar.radio("日期对齐", [1, 0], format_func=lambda x: "QDII 净值对齐前一美股交易日（推荐）" if x else "同日对齐",
                            key="holding_lag")
@@ -2446,16 +2622,28 @@ def render_holdings():
         wr = window_returns(frame).set_index("区间")
         y1 = wr.loc["近1年"] if "近1年" in wr.index and pd.notna(wr.loc["近1年"].get("基金%")) else None
         m1 = wr.loc["近1月"]
+        def pct(v):
+            return "—" if v is None or pd.isna(v) else f'<b style="color:{up_down_color(v)}">{v:+.1f}%</b>'
+
+        def pair(row, label):
+            if row is None:
+                return f'<div><span>{label}</span><b>—</b></div>'
+            ex = row["超额(百分点)"]
+            return (f'<div class="fundcell"><span>{label}</span>'
+                    f'<p><i>基金</i>{pct(row["基金%"])}</p><p><i>基准</i>{pct(row["基准(人民币)%"])}</p>'
+                    f'<p><i>超额</i><b style="color:{up_down_color(ex)}">{ex:+.1f}pp</b></p></div>')
+
         card.markdown(
             f"""<div class="hero-card">
-              <div class="hero-label">{holding['name']}（{holding['code']}） vs {holding['bench_name']}</div>
-              <div class="hero-grid" style="margin-top:12px">
+              <div class="fund-title">{holding['name']}<small>{holding['code']}</small></div>
+              <div class="hero-label" style="margin-top:4px">对比基准 · {holding['bench_name']}</div>
+              <div class="hero-grid" style="margin-top:14px">
+                <div><span>最新净值</span><b>{frame['单位净值'].iloc[-1]:.4f}</b></div>
                 <div><span>净值日期</span><b style="font-size:1.05rem">{frame.index[-1]:%Y-%m-%d}</b></div>
-                <div><span>单位净值</span><b>{frame['单位净值'].iloc[-1]:.4f}</b></div>
-                <div><span>对齐美股日</span><b style="font-size:1.05rem">{pd.Timestamp(frame['美股日期'].iloc[-1]):%Y-%m-%d}</b></div>
-                <div><span>近1月 基金/基准</span><b style="font-size:1.05rem">{m1['基金%']:+.1f}% / {m1['基准(人民币)%']:+.1f}%</b></div>
-                <div><span>近1年 基金/基准</span><b style="font-size:1.05rem">{(f"{y1['基金%']:+.1f}% / {y1['基准(人民币)%']:+.1f}%") if y1 is not None else "—"}</b></div>
-                <div><span>近1年 超额</span><b style="font-size:1.05rem">{(f"{y1['超额(百分点)']:+.1f}pp") if y1 is not None else "—"}</b></div>
+                <div><span>对齐美股收盘</span><b style="font-size:1.05rem">{pd.Timestamp(frame['美股日期'].iloc[-1]):%Y-%m-%d}</b></div>
+              </div>
+              <div class="hero-grid" style="margin-top:12px;grid-template-columns:1fr 1fr">
+                {pair(m1, "近1个月")}{pair(y1, "近1年")}
               </div></div>""", unsafe_allow_html=True)
     if not frames:
         return
@@ -2487,8 +2675,9 @@ def render_holdings():
                                      line=dict(color=C_BLUE, width=2)))
             fig.add_trace(go.Scatter(x=norm.index, y=norm["基准美元"], name=holding["bench_short"] + "（美元）",
                                      line=dict(color=C_MUTED, width=1.3, dash="dot")))
-            layout = dark_layout(height=420, y_title="累计收益 (%)", title_text=f"累计收益对比 · {choice}")
-            layout.update(showlegend=True, legend=dict(orientation="h", y=1.12, x=0))
+            layout = dark_layout(height=440, y_title="累计收益 (%)", title_text=f"累计收益对比 · {choice}")
+            layout.update(showlegend=True, legend=dict(orientation="h", y=1.1, x=1, xanchor="right", font=dict(size=12, color=C_MUTED)),
+                          margin=dict(l=8, r=8, t=56, b=8))
             fig.update_layout(**layout)
             st.plotly_chart(fig, width="stretch")
             ex = (frame["基金"] / frame["基金"].shift(63) - frame["基准人民币"] / frame["基准人民币"].shift(63)) * 100
@@ -2511,6 +2700,7 @@ def render_holdings():
 
 def render_preview_entrypoint():
     install_market_auto_refresh()
+    render_topbar()
     page = st.radio('功能导航', ['综合指数看板', '历史回测分析', '持仓基金对比', '主动基金筛选', '数据与备份', '美投对照'],
                     horizontal=True, key='main_page', label_visibility='collapsed')
     if page == '美投对照':
@@ -2524,108 +2714,192 @@ def render_preview_entrypoint():
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="AI泡沫指数 · 美投对照", page_icon="📈", layout="wide")
+    try:  # 单文件内设定深色主题（表格、输入控件随之变暗）；不支持的版本忽略
+        for _k, _v in {"theme.base": "dark", "theme.primaryColor": "#E8B84A", "theme.backgroundColor": "#0A0D13",
+                       "theme.secondaryBackgroundColor": "#121824", "theme.textColor": "#E6E9EF"}.items():
+            st._config.set_option(_k, _v)
+    except Exception:
+        pass
+    st.set_page_config(page_title="AI 泡沫指数 · 高章磊", page_icon="📈", layout="wide")
     
     # ============================================================
     # Bloomberg / TradingView 深色主题 CSS
     # ============================================================
     st.markdown("""
     <style>
-    /* 主背景 */
-    .stApp { background-color: #131722; color: #d1d4dc; }
-    [data-testid="stHeader"] { background-color: #131722; }
-    button[kind="secondary"], [data-testid="stFileUploaderDropzone"],
-    [data-testid="stNumberInputContainer"], [data-testid="stNumberInputContainer"] button,
-    input, textarea { background-color: #1e222d !important; color: #d1d4dc !important; }
-    button[kind="secondary"] { border-color: #4a4e59 !important; }
-    button:disabled { opacity: 0.5; }
-    
-    /* 侧边栏 */
-    section[data-testid="stSidebar"] {
-        background-color: #1e222d;
-        border-right: 1px solid #2a2e39;
-    }
-    section[data-testid="stSidebar"] * { color: #d1d4dc !important; }
-    
-    /* 指标卡片 */
-    [data-testid="metric-container"] {
-        background-color: #1e222d;
-        border: 1px solid #2a2e39;
-        border-radius: 8px;
-        padding: 16px 20px;
-    }
-    [data-testid="stMetricValue"] {
-        color: #d1d4dc !important;
-        font-family: 'Courier New', monospace !important;
-        font-size: 1.8rem !important;
-        font-weight: 700 !important;
-    }
-    [data-testid="stMetricLabel"] { color: #787b86 !important; font-size: 0.9rem !important; font-weight: 600 !important; }
-    [data-testid="stMetricDelta"] { font-family: 'Courier New', monospace !important; font-weight: 600 !important; }
-    
-    /* 标题 */
-    h1, h2, h3 { color: #d1d4dc !important; }
-    h1 { font-family: 'Courier New', monospace !important; border-bottom: 1px solid #2a2e39; padding-bottom: 8px; }
-    
-    /* 分割线 */
-    hr { border-color: #2a2e39 !important; }
-    
-    /* Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        background-color: #1e222d;
-        border-bottom: 1px solid #2a2e39;
-        gap: 4px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        color: #787b86;
-        background-color: transparent;
-        border-radius: 6px 6px 0 0;
-        padding: 8px 20px;
-        font-family: 'Courier New', monospace;
-    }
-    .stTabs [aria-selected="true"] {
-        color: #2962ff !important;
-        border-bottom: 2px solid #2962ff !important;
-        background-color: rgba(41,98,255,0.08) !important;
-    }
-    
-    /* Selectbox / Dropdown */
-    [data-baseweb="select"] { background-color: #1e222d !important; border-color: #2a2e39 !important; }
-    [data-baseweb="select"] * { color: #d1d4dc !important; background-color: #1e222d !important; }
-    
-    /* Dataframe */
-    [data-testid="stDataFrame"] { border: 1px solid #2a2e39; border-radius: 6px; }
-    
-    /* Spinner */
-    .stSpinner > div { border-top-color: #2962ff !important; }
-    
-    /* Slider */
-    [data-testid="stSlider"] [data-baseweb="slider"] [role="slider"] {
-        background-color: #2962ff !important;
-        border-color: #2962ff !important;
-    }
-    
-    /* Markdown */
-    .stMarkdown, p { color: #d1d4dc !important; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+    :root { --bg:#0A0D13; --panel:#10151E; --panel2:#151B26; --line:#212938; --text:#E6E9EF;
+            --muted:#8A93A3; --gold:#E8B84A; --blue:#3D7BFF;
+            --shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 10px 28px rgba(0,0,0,.45), 0 2px 6px rgba(0,0,0,.35);
+            --shadow-sm: 0 1px 0 rgba(255,255,255,.05) inset, 0 4px 12px rgba(0,0,0,.35); }
+    html, body, .stApp, [class*="css"] { font-family: Inter, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .stApp { background: radial-gradient(1200px 500px at 70% -10%, #121a2a 0%, var(--bg) 60%); color: var(--text); }
+    [data-testid="stHeader"] { background: transparent; }
+    .block-container { padding-top: 1.6rem; max-width: 1560px; }
+    p, .stMarkdown, label { color: var(--text) !important; }
+    h1, h2, h3, h4 { color: var(--text) !important; font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif !important; }
+    h4 { font-size: 1.02rem !important; letter-spacing: .3px; margin-top: 1.4rem !important;
+         padding-left: 10px; border-left: 3px solid var(--gold); }
+    [data-testid="stCaptionContainer"], .stCaption, small { color: var(--muted) !important; }
 
-    /* V4 页面元素 */
-    html, body, [class*="css"] { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
-    .block-container { padding-top: 2.2rem; max-width: 1500px; }
-    .app-title { font-size: 1.85rem; font-weight: 700; color: #e9ecf2; letter-spacing: .5px;
-                 padding-bottom: 10px; margin-bottom: 6px; border-bottom: 1px solid #2a2e39; }
-    .app-title span { font-size: .95rem; font-weight: 500; color: #787b86; margin-left: 12px; }
-    .hero-card { background: linear-gradient(160deg, #1e222d 0%, #181c26 100%); border: 1px solid #2a2e39;
-                 border-radius: 14px; padding: 20px 24px; margin-top: 8px; }
-    .hero-label { color: #787b86; font-size: .9rem; letter-spacing: .4px; }
-    .hero-zone { display: inline-block; margin: 10px 0 16px; padding: 6px 14px; border: 1.5px solid;
-                 border-radius: 999px; font-size: 1.15rem; font-weight: 700; background: rgba(255,255,255,.03); }
-    .hero-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 18px; }
-    .hero-grid div { background: #131722; border: 1px solid #262a35; border-radius: 10px; padding: 10px 12px; }
-    .hero-grid span { display: block; color: #787b86; font-size: .8rem; }
-    .hero-grid b { font-family: 'Courier New', monospace; font-size: 1.35rem; color: #e9ecf2; }
-    .hero-foot { color: #5d606b; font-size: .78rem; margin-top: 12px; }
-    .stTabs [data-baseweb="tab"] { font-family: inherit !important; font-size: .98rem; }
-    h4 { color: #c9ccd6 !important; margin-top: 1.2rem !important; }
+    /* 侧边栏 */
+    section[data-testid="stSidebar"] { background: #0D1119; border-right: 1px solid var(--line); }
+    section[data-testid="stSidebar"] * { color: #C9CED8 !important; }
+    section[data-testid="stSidebar"] h2 { font-size: 1.05rem !important; letter-spacing: .5px; }
+
+    /* 输入控件 */
+    button[kind="secondary"], [data-testid="stFileUploaderDropzone"], [data-testid="stNumberInputContainer"],
+    [data-testid="stNumberInputContainer"] button, input, textarea {
+        background-color: var(--panel) !important; color: var(--text) !important; border-color: var(--line) !important; }
+    button[kind="secondary"]:hover { border-color: var(--gold) !important; color: var(--gold) !important; }
+    [data-baseweb="select"] { background-color: var(--panel) !important; }
+    [data-baseweb="select"] * { color: var(--text) !important; background-color: var(--panel) !important; }
+
+    /* 顶栏与作者 */
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:28px;
+              padding: 16px 22px; margin-bottom: 18px; border:1px solid var(--line); border-radius: 16px;
+              background: linear-gradient(90deg, rgba(232,184,74,.08), rgba(19,25,36,.96) 35%, rgba(16,21,30,.96));
+              box-shadow: var(--shadow); }
+    .brand-name { margin-bottom: 3px; }
+    .brand { display:flex; align-items:center; gap:14px; }
+    .logo { width:42px; height:42px; border-radius:10px; display:grid; place-items:center; font-weight:800;
+            font-family:'JetBrains Mono',monospace; color:#0A0D13; background: linear-gradient(135deg,#F5D27A,#C9932B);
+            box-shadow: 0 0 18px rgba(232,184,74,.35); }
+    .brand-name { font-family:'JetBrains Mono',monospace; font-weight:600; letter-spacing:2.5px; color:var(--text); font-size:1.05rem; }
+    .brand-sub { color: var(--muted); font-size:.8rem; margin-top:2px; }
+    .clocks { display:flex; gap:22px; }
+    .clocks div { text-align:center; }
+    .clocks span { display:block; color:var(--muted); font-size:.7rem; letter-spacing:1px; }
+    .clocks b { font-family:'JetBrains Mono',monospace; font-weight:500; color:#C9CED8; font-size:.95rem; }
+    .author { display:flex; align-items:center; gap:16px; padding:10px 12px 10px 22px; border-radius: 14px;
+              border:1px solid rgba(232,184,74,.45);
+              background: linear-gradient(180deg, rgba(232,184,74,.12), rgba(232,184,74,.03));
+              box-shadow: 0 8px 24px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.08), 0 0 22px rgba(232,184,74,.10); }
+    .author-text { text-align:right; line-height:1.35; }
+    .author-text span { display:block; font-size:.66rem; letter-spacing:1.6px; color: var(--gold); margin-bottom:3px; }
+    .author-text b { display:block; font-size:1.3rem; color:#F6E7C1; letter-spacing:3px; margin:1px 0 2px; }
+    .author-text em { display:block; font-style:normal; font-size:.72rem; color:var(--muted); letter-spacing:1.2px; }
+    .avatar { width:50px; height:50px; border-radius:50%; display:grid; place-items:center; font-size:1.35rem; font-weight:700;
+              color:#0A0D13; background: radial-gradient(circle at 35% 30%, #FFE7A3, #D9A23A 60%, #A8741C);
+              box-shadow: 0 4px 12px rgba(0,0,0,.5), inset 0 -3px 6px rgba(0,0,0,.25), inset 0 2px 3px rgba(255,255,255,.45); }
+
+    /* 主导航：分段按钮 */
+    [data-testid="stMain"] div[role="radiogroup"] { gap: 6px; flex-wrap: wrap; }
+    [data-testid="stMain"] div[role="radiogroup"] > label { background: var(--panel); border: 1px solid var(--line);
+        border-radius: 8px; padding: 6px 14px !important; margin: 0 !important; transition: all .15s; }
+    [data-testid="stMain"] div[role="radiogroup"] > label > div:first-child { display: none; }
+    [data-testid="stMain"] div[role="radiogroup"] > label:hover { border-color: #3a4558; }
+    [data-testid="stMain"] div[role="radiogroup"] > label:has(input:checked) { background: rgba(232,184,74,.12); border-color: var(--gold); }
+    [data-testid="stMain"] div[role="radiogroup"] > label:has(input:checked) p { color: var(--gold) !important; font-weight: 600; }
+    /* 新版 Streamlit（react-aria）单选结构 */
+    [data-testid="stMain"] [data-testid="stRadioOption"] { background: var(--panel); border: 1px solid var(--line);
+        border-radius: 8px; padding: 6px 14px !important; margin: 0 6px 6px 0 !important; transition: all .15s; cursor: pointer; }
+    [data-testid="stMain"] [data-testid="stRadioOption"] > div > div:first-child:not(:only-child) { display: none !important; }
+    [data-testid="stMain"] [data-testid="stRadioOption"]:hover { border-color: #3a4558; }
+    [data-testid="stMain"] [data-testid="stRadioOption"][data-selected="true"] { background: rgba(232,184,74,.12); border-color: var(--gold); }
+    [data-testid="stMain"] [data-testid="stRadioOption"][data-selected="true"] p { color: var(--gold) !important; font-weight: 600; }
+
+    /* 页面标题与状态标签 */
+    .page-head { display:flex; align-items:baseline; gap:16px; margin: 22px 0 8px; }
+    .page-head h2 { margin:0; padding:0; font-size:1.55rem; font-weight:700; }
+    .page-head > span { color: var(--muted); font-size:.9rem; }
+    .page-head h2 span { color: var(--text) !important; }
+    .page-head [data-testid="stHeaderActionElements"] { display:none; }
+    .chips { display:flex; flex-wrap:wrap; gap:8px; margin: 6px 0 12px; }
+    .chip { display:inline-flex; align-items:center; gap:7px; padding:4px 11px; border-radius:999px; font-size:.78rem;
+            color: var(--muted); background: var(--panel); border:1px solid var(--line); }
+    .chip b { color: #C9CED8; font-weight:500; }
+    .chip i { width:7px; height:7px; border-radius:50%; background: var(--muted); }
+    .chip-ok i { background:#1FB47E; box-shadow:0 0 6px #1FB47E; }
+    .chip-warn i { background:#F59F00; box-shadow:0 0 6px #F59F00; }
+    .chip-info i { background: var(--blue); }
+
+    /* 行情快照条 */
+    .ticker { display:grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap:8px; margin: 6px 0 18px; }
+    .tick { background: linear-gradient(180deg, #161D2A, #10151E); padding: 10px 12px; border:1px solid var(--line); min-width:0;
+            border-radius: 12px; box-shadow: var(--shadow-sm); transition: transform .15s, border-color .15s; }
+    .tick:hover { transform: translateY(-2px); border-color:#33405a; }
+    .tick span { display:block; color: var(--muted); font-size:.74rem; letter-spacing:.3px; margin-bottom:5px; }
+    .tick span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .tick b { display:block; font-family:'JetBrains Mono',monospace; font-size:1.05rem; font-weight:600; color: var(--text); white-space:nowrap; }
+    .tick em { display:block; font-family:'JetBrains Mono',monospace; font-style:normal; font-size:.76rem; margin-top:2px; white-space:nowrap; }
+    /* 区间阶梯 */
+    .ladder-card { background: linear-gradient(180deg, #131A26, var(--panel)); border:1px solid var(--line); border-radius:16px;
+                   padding: 14px 18px 14px; box-shadow: var(--shadow); margin-top: -2px; }
+    .ladder { position:relative; display:flex; height:12px; border-radius:7px; overflow:visible; margin: 18px 0 8px; }
+    .ladder > div.seg { height:100%; opacity:.85; }
+    .ladder > div.seg:first-child { border-radius:7px 0 0 7px; } .ladder > div.seg:last-of-type { border-radius:0 7px 7px 0; }
+    .ladder .mark { position:absolute; top:-7px; width:3px; height:26px; background:#fff; border-radius:2px;
+                    box-shadow: 0 0 10px rgba(255,255,255,.7); transform: translateX(-50%); }
+    .ladder .mark b { position:absolute; top:-20px; left:50%; transform:translateX(-50%); font-family:'JetBrains Mono',monospace;
+                      font-size:.78rem; color:#fff; white-space:nowrap; }
+    .ladder-scale { position:relative; height:14px; font-family:'JetBrains Mono',monospace; font-size:.68rem; color:#6b7385; }
+    .ladder-scale span { position:absolute; transform:translateX(-50%); }
+    .ladder-scale span:first-child { transform:none; } .ladder-scale span:last-child { transform:translateX(-100%); }
+    .ladder-txt { display:flex; justify-content:space-between; gap:10px; margin-top:10px; font-size:.8rem; color:var(--muted); }
+    .ladder-txt b { font-family:'JetBrains Mono',monospace; color: var(--text); }
+
+    /* 主读数卡片 */
+    .hero-card { background: linear-gradient(160deg, #18202E 0%, var(--panel) 70%); border: 1px solid var(--line);
+                 border-radius: 16px; padding: 22px 26px; margin-top: 4px; box-shadow: var(--shadow); }
+    .hero-label { color: var(--muted); font-size: .78rem; letter-spacing: 1.2px; text-transform: uppercase; }
+    .hero-zone { display: inline-block; margin: 10px 0 14px; padding: 5px 14px; border: 1.5px solid;
+                 border-radius: 999px; font-size: 1.08rem; font-weight: 700; background: rgba(255,255,255,.03); }
+    .hero-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px 12px; }
+    .hero-grid div { background: linear-gradient(180deg, #0F141D, #0B0F16); border: 1px solid var(--line); border-radius: 11px;
+                     padding: 11px 14px; box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 3px 8px rgba(0,0,0,.3); }
+    .hero-grid span { display: block; color: var(--muted); font-size: .76rem; margin-bottom: 4px; }
+    .hero-grid b { font-family: 'JetBrains Mono', monospace; font-size: 1.3rem; font-weight:600; color: var(--text); }
+    .hero-foot { color: #6b7385; font-size: .74rem; margin-top: 14px; line-height: 1.5; }
+    .heatrow { display:grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap:7px; margin-top: 16px; }
+    .heat { border-radius: 10px; padding: 8px 8px 7px; line-height: 1.3; min-width:0;
+            background: linear-gradient(180deg, color-mix(in srgb, var(--c) 22%, #0D1119), color-mix(in srgb, var(--c) 8%, #0B0F16));
+            border: 1px solid color-mix(in srgb, var(--c) 50%, transparent);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 4px 10px rgba(0,0,0,.35); }
+    .heat span { display:block; font-family:'JetBrains Mono',monospace; font-size:.68rem; color: var(--muted); }
+    .heat b { display:block; font-family:'JetBrains Mono',monospace; font-size:1.2rem; color: var(--c); margin: 1px 0 2px;
+              text-shadow: 0 0 10px color-mix(in srgb, var(--c) 45%, transparent); }
+    .heat em { display:block; font-style:normal; font-size:.68rem; color:#AEB5C2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+    .fund-title { font-size:1.08rem; font-weight:600; color:#F1F3F7; line-height:1.4; }
+    .fund-title small { margin-left:10px; font-family:'JetBrains Mono',monospace; font-size:.8rem; color:var(--gold);
+                        padding:2px 8px; border:1px solid rgba(232,184,74,.4); border-radius:6px; }
+    .fundcell p { display:flex; justify-content:space-between; align-items:baseline; margin:3px 0 0 !important; }
+    .fundcell p i { font-style:normal; color: var(--muted); font-size:.78rem; }
+    .fundcell p b { font-size:1.05rem !important; }
+    /* 构成表 */
+    .ctable { width:100%; border-collapse: separate; border-spacing:0; font-size:.86rem; background: var(--panel);
+              border:1px solid var(--line); border-radius: 14px; overflow:hidden; box-shadow: var(--shadow); }
+    .ctable tr:hover td { background: rgba(255,255,255,.025); }
+    .ctable th { text-align:left; color: var(--muted); font-weight:500; font-size:.74rem; letter-spacing:.5px;
+                 padding: 9px 12px; background:#0D1119; border-bottom: 1px solid var(--line); }
+    .ctable td { padding: 10px 14px; border-bottom: 1px solid #1a2130; color: var(--text); line-height:1.45; }
+    .ctable tr.grp td { background: rgba(232,184,74,.06); font-weight:600; color:#F6E7C1; }
+    .ctable td.num { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .ctable td.src { color: var(--muted); font-size:.78rem; }
+    .bar { height:8px; background:#1a2130; border-radius:6px; overflow:hidden; }
+    .bar div { height:100%; border-radius:6px; }
+
+    /* 标签页、表格、提示 */
+    .stTabs [data-baseweb="tab-list"] { background: transparent; border-bottom: 1px solid var(--line); gap: 2px; }
+    .stTabs [data-baseweb="tab"] { color: var(--muted); background: transparent; padding: 8px 18px; font-size: .95rem; }
+    .stTabs [aria-selected="true"] { color: var(--gold) !important; border-bottom: 2px solid var(--gold) !important;
+                                     background: rgba(232,184,74,.06) !important; }
+    .stTabs [data-baseweb="tab-highlight"] { background: var(--gold) !important; }
+    [data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); overflow:hidden; }
+    /* 图表卡片化 */
+    [data-testid="stPlotlyChart"] { background: linear-gradient(180deg, #131A26, var(--panel)); border: 1px solid var(--line);
+        border-radius: 16px; padding: 10px 12px 6px; box-shadow: var(--shadow); margin-bottom: 8px; }
+    .chip { box-shadow: var(--shadow-sm); padding: 5px 13px !important; }
+    .chips { gap: 10px !important; margin: 8px 0 14px !important; }
+    [data-testid="stAlert"] { border-radius: 10px; }
+    [data-testid="metric-container"] { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; }
+    [data-testid="stMetricValue"] { font-family: 'JetBrains Mono', monospace !important; font-weight: 600 !important; color: var(--text) !important; }
+    [data-testid="stMetricLabel"] { color: var(--muted) !important; }
+    hr { border-color: var(--line) !important; }
+    .stSpinner > div { border-top-color: var(--gold) !important; }
+    @media (max-width: 1100px) { .ticker { grid-template-columns: repeat(4, minmax(0,1fr)); } }
+    @media (max-width: 900px) { .clocks { display:none; } .heatrow { grid-template-columns: repeat(4,1fr); } .topbar { flex-wrap: wrap; } }
     </style>
     """, unsafe_allow_html=True)
     
