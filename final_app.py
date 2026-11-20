@@ -710,6 +710,7 @@ def render_main(section="综合指数看板"):
                 with st.spinner("正在获取完整历史行情…"):
                     raw, note = load_live_market()
                 if note: st.warning(note)
+                if raw.attrs.get('lag_note'): st.info(raw.attrs['lag_note'])
             except Exception as exc:
                 saved = newest_backup()
                 if saved is None:
@@ -2271,12 +2272,23 @@ def fetch_market_data(refresh_bucket=None):
     if raw.empty:
         raise ValueError('没有已收盘的有效行情')
     anchor = raw[('Close', 'QQQ')].last_valid_index()
-    for field, ticker in [('Close', t) for t in TICKERS] + [('Volume', 'IPO')]:
-        if raw[(field, ticker)].last_valid_index() < anchor:
-            raise ValueError(f'{ticker}/{field} 最新行情落后于QQQ，拒绝把旧数据标为最新')
+    required = [('Close', t) for t in TICKERS] + [('Volume', 'IPO')]
+    lag_note = ''
+    lagging = {f'{t}/{f}': raw[(f, t)].last_valid_index() for f, t in required if raw[(f, t)].last_valid_index() < anchor}
+    if lagging:
+        # 个别标的（如成交稀疏的 IPO ETF）最新一根K线晚到：截到所有标的共同的最新日期，不把旧数据标为最新
+        common = min(lagging.values())
+        qqq_dates = raw[('Close', 'QQQ')].dropna().index
+        lag_days = int(((qqq_dates > common) & (qqq_dates <= anchor)).sum())
+        if lag_days > 3:
+            raise ValueError(f'{", ".join(lagging)} 落后QQQ {lag_days} 个交易日，拒绝把旧数据标为最新')
+        raw = raw.loc[:common]
+        lag_note = (f'{", ".join(lagging)} 在 Yahoo 的最新数据只到 {common:%Y-%m-%d}（QQQ 已到 {anchor:%Y-%m-%d}），'
+                    f'整体行情按共同日期 {common:%Y-%m-%d} 计算；数据源补齐后会自动更新。')
     saved = newest_backup()
     if saved is not None:
         old, _ = saved
+        old = old.loc[:raw.index[-1]]
         for field, ticker in [('Close', t) for t in TICKERS] + [('Volume', 'IPO')]:
             lost = old[(field, ticker)].dropna().index.difference(raw[(field, ticker)].dropna().index)
             if len(lost):
@@ -2288,6 +2300,7 @@ def fetch_market_data(refresh_bucket=None):
             save_snapshot(raw)
         except OSError as exc:
             note = f'在线行情已获取，但本地备份写入失败：{exc}。请下载备份。'
+    raw.attrs['lag_note'] = lag_note
     return raw, note
 
 
